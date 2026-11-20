@@ -1,0 +1,469 @@
+{
+  "layout": "section",
+  "tool": "select",
+  "dockSort": "area",
+  "useGross": false,
+  "sidebarTab": "iterations",
+  "sidebarOpen": true,
+  "dockOpen": true,
+  "keywords": [
+    {
+      "id": "daylit",
+      "label": "daylit",
+      "group": "Climate",
+      "enabled": true
+    },
+    {
+      "id": "indirect-daylight",
+      "label": "indirect daylight",
+      "group": "Climate",
+      "enabled": true
+    },
+    {
+      "id": "blackout-capable",
+      "label": "blackout-capable",
+      "group": "Climate",
+      "enabled": true
+    },
+    {
+      "id": "cross-ventilated",
+      "label": "cross-ventilated",
+      "group": "Climate",
+      "enabled": true
+    },
+    {
+      "id": "rain-sheltered",
+      "label": "rain-sheltered",
+      "group": "Climate",
+      "enabled": true
+    },
+    {
+      "id": "deep-roof",
+      "label": "deep roof",
+      "group": "Climate",
+      "enabled": true
+    },
+    {
+      "id": "cool-dry",
+      "label": "cool & dry",
+      "group": "Climate",
+      "enabled": true
+    },
+    {
+      "id": "damp-sensitive",
+      "label": "damp/mould control",
+      "group": "Climate",
+      "enabled": true
+    },
+    {
+      "id": "dark-stable",
+      "label": "dark & stable",
+      "group": "Climate",
+      "enabled": true
+    },
+    {
+      "id": "thermal-mass",
+      "label": "thermal mass",
+      "group": "Climate",
+      "enabled": true
+    },
+    {
+      "id": "drying-monsoon",
+      "label": "monsoon drying",
+      "group": "Climate",
+      "enabled": true
+    },
+    {
+      "id": "semi-open",
+      "label": "semi-open",
+      "group": "Climate",
+      "enabled": true
+    },
+    {
+      "id": "quiet",
+      "label": "quiet",
+      "group": "Social & Acoustic",
+      "enabled": true
+    },
+    {
+      "id": "private",
+      "label": "private",
+      "group": "Social & Acoustic",
+      "enabled": true
+    },
+    {
+      "id": "social-heart",
+      "label": "social heart",
+      "group": "Social & Acoustic",
+      "enabled": true
+    },
+    {
+      "id": "public-gathering",
+      "label": "public gathering",
+      "group": "Social & Acoustic",
+      "enabled": true
+    },
+    {
+      "id": "communal-dining",
+      "label": "communal dining",
+      "group": "Social & Acoustic",
+      "enabled": true
+    },
+    {
+      "id": "flexible",
+      "label": "flexible",
+      "group": "Social & Acoustic",
+      "enabled": true
+    },
+    {
+      "id": "live-work",
+      "label": "live-work",
+      "group": "Social & Acoustic",
+      "enabled": true
+    },
+    {
+      "id": "step-free",
+      "label": "step-free",
+      "group": "Social & Acoustic",
+      "enabled": true
+    },
+    {
+      "id": "accessible",
+      "label": "accessible WC",
+      "group": "Social & Acoustic",
+      "enabled": true
+    },
+    {
+      "id": "slope-view",
+      "label": "slope & view",
+      "group": "Ground & Water",
+      "enabled": true
+    },
+    {
+      "id": "earth-sheltered",
+      "label": "earth-sheltered",
+      "group": "Ground & Water",
+      "enabled": true
+    },
+    {
+      "id": "vegetated-terraces",
+      "label": "vegetated terraces",
+      "group": "Ground & Water",
+      "enabled": true
+    },
+    {
+      "id": "avoid-slope-cut",
+      "label": "avoid bare slope cut",
+      "group": "Ground & Water",
+      "enabled": true
+    },
+    {
+      "id": "permeable",
+      "label": "permeable surface",
+      "group": "Ground & Water",
+      "enabled": true
+    },
+    {
+      "id": "water-cycle",
+      "label": "rain/greywater cycle",
+      "group": "Ground & Water",
+      "enabled": true
+    },
+    {
+      "id": "leachate-capture",
+      "label": "leachate capture",
+      "group": "Ground & Water",
+      "enabled": true
+    },
+    {
+      "id": "roof-water-shedding",
+      "label": "roof water-shedding",
+      "group": "Ground & Water",
+      "enabled": true
+    },
+    {
+      "id": "predator-secure",
+      "label": "predator-secure",
+      "group": "Ground & Water",
+      "enabled": true
+    },
+    {
+      "id": "arrival-entry",
+      "label": "oversees arrival/entry",
+      "group": "Adjacency",
+      "enabled": true
+    },
+    {
+      "id": "kitchen-link",
+      "label": "linked to kitchen",
+      "group": "Adjacency",
+      "enabled": true
+    },
+    {
+      "id": "hall-link",
+      "label": "adjacent to hall",
+      "group": "Adjacency",
+      "enabled": true
+    },
+    {
+      "id": "verandah-link",
+      "label": "adjacent to verandah",
+      "group": "Adjacency",
+      "enabled": true
+    },
+    {
+      "id": "food-storage-link",
+      "label": "direct to food storage",
+      "group": "Adjacency",
+      "enabled": true
+    },
+    {
+      "id": "delivery-route",
+      "label": "delivery route",
+      "group": "Adjacency",
+      "enabled": true
+    },
+    {
+      "id": "library-link",
+      "label": "by the library",
+      "group": "Adjacency",
+      "enabled": true
+    },
+    {
+      "id": "farmland-cycle",
+      "label": "farmland / garden cycle",
+      "group": "Adjacency",
+      "enabled": true
+    },
+    {
+      "id": "wet-service",
+      "label": "wet service",
+      "group": "Adjacency",
+      "enabled": true
+    },
+    {
+      "id": "cleaning-store",
+      "label": "cleaning store",
+      "group": "Adjacency",
+      "enabled": true
+    },
+    {
+      "id": "visiting-staff",
+      "label": "visiting Foundation staff",
+      "group": "Adjacency",
+      "enabled": true
+    },
+    {
+      "id": "minimal-wet-walk",
+      "label": "minimise wet walk",
+      "group": "Adjacency",
+      "enabled": true
+    }
+  ],
+  "volumes": [
+    {
+      "id": "B2",
+      "ref": "B2",
+      "name": "Multipurpose hall",
+      "short": "Hall",
+      "cat": "B",
+      "area": 186,
+      "freeResize": false,
+      "excludeFromNetTotal": false,
+      "w": 16.695346943604754,
+      "d": 11.140828676893614,
+      "floors": 1,
+      "floorHeight": 3,
+      "rot": -1.0471975511965976,
+      "x": -16.345518067347097,
+      "y": -37.040240118388226,
+      "zBase": 1983.98,
+      "groupId": null,
+      "zOrder": 3,
+      "keywords": [
+        "public-gathering",
+        "flexible",
+        "daylit",
+        "blackout-capable",
+        "step-free",
+        "roof-water-shedding",
+        "kitchen-link",
+        "slope-view",
+        "hall-link"
+      ],
+      "links": [
+        "B3",
+        "B4",
+        "B5",
+        "B1"
+      ],
+      "separations": [
+        "A1",
+        "A3",
+        "C1"
+      ],
+      "note": "Largest room: lectures and workshops, exhibitions, dance, film, large banquets. Structural set-piece: show spanning and roof water-shedding in section. Flexible, daylit but black-out-capable, step-free, linked to kitchen and outdoors."
+    }
+  ],
+  "selectedIds": [
+    "B2"
+  ],
+  "planes": [
+    {
+      "id": "sec-A",
+      "name": "A",
+      "cx": 1.0355106081933303,
+      "cy": -30.239250168909916,
+      "angleDeg": 29.54875582536665,
+      "flipped": false,
+      "enabled": true,
+      "projDepth": 18
+    }
+  ],
+  "activePlaneId": "sec-A",
+  "dimensions": [],
+  "layers": {
+    "siteBoundary": true,
+    "contours": true,
+    "roads": true,
+    "waterways": true,
+    "buildings": true,
+    "trees": false,
+    "cutFill": true,
+    "translucentTerrain": false
+  },
+  "iterations": [
+    {
+      "id": "iter-1795183503797",
+      "name": "01",
+      "timestamp": "2026-11-20T14:05:03.797Z",
+      "cut": 82.89561807937632,
+      "fill": 44.470455775992896,
+      "volumes": [
+        {
+          "id": "B2",
+          "ref": "B2",
+          "name": "Multipurpose hall",
+          "short": "Hall",
+          "cat": "B",
+          "area": 186,
+          "freeResize": false,
+          "excludeFromNetTotal": false,
+          "w": 16.695346943604754,
+          "d": 11.140828676893614,
+          "floors": 1,
+          "floorHeight": 3,
+          "rot": -1.0471975511965976,
+          "x": -16.345518067347097,
+          "y": -37.040240118388226,
+          "zBase": 1983.98,
+          "groupId": null,
+          "zOrder": 3,
+          "keywords": [
+            "public-gathering",
+            "flexible",
+            "daylit",
+            "blackout-capable",
+            "step-free",
+            "roof-water-shedding",
+            "kitchen-link",
+            "slope-view",
+            "hall-link"
+          ],
+          "links": [
+            "B3",
+            "B4",
+            "B5",
+            "B1"
+          ],
+          "separations": [
+            "A1",
+            "A3",
+            "C1"
+          ],
+          "note": "Largest room: lectures and workshops, exhibitions, dance, film, large banquets. Structural set-piece: show spanning and roof water-shedding in section. Flexible, daylit but black-out-capable, step-free, linked to kitchen and outdoors."
+        }
+      ],
+      "planes": [
+        {
+          "id": "sec-A",
+          "name": "A",
+          "cx": 1.0355106081933303,
+          "cy": -30.239250168909916,
+          "angleDeg": 29.54875582536665,
+          "flipped": false,
+          "enabled": true,
+          "projDepth": 18
+        }
+      ],
+      "activePlaneId": "sec-A"
+    },
+    {
+      "id": "iter-1795183498886",
+      "name": "01",
+      "timestamp": "2026-11-20T14:04:58.886Z",
+      "cut": 82.89561807937632,
+      "fill": 44.470455775992896,
+      "volumes": [
+        {
+          "id": "B2",
+          "ref": "B2",
+          "name": "Multipurpose hall",
+          "short": "Hall",
+          "cat": "B",
+          "area": 186,
+          "freeResize": false,
+          "excludeFromNetTotal": false,
+          "w": 16.695346943604754,
+          "d": 11.140828676893614,
+          "floors": 1,
+          "floorHeight": 3,
+          "rot": -1.0471975511965976,
+          "x": -16.345518067347097,
+          "y": -37.040240118388226,
+          "zBase": 1983.98,
+          "groupId": null,
+          "zOrder": 3,
+          "keywords": [
+            "public-gathering",
+            "flexible",
+            "daylit",
+            "blackout-capable",
+            "step-free",
+            "roof-water-shedding",
+            "kitchen-link",
+            "slope-view",
+            "hall-link"
+          ],
+          "links": [
+            "B3",
+            "B4",
+            "B5",
+            "B1"
+          ],
+          "separations": [
+            "A1",
+            "A3",
+            "C1"
+          ],
+          "note": "Largest room: lectures and workshops, exhibitions, dance, film, large banquets. Structural set-piece: show spanning and roof water-shedding in section. Flexible, daylit but black-out-capable, step-free, linked to kitchen and outdoors."
+        }
+      ],
+      "planes": [
+        {
+          "id": "sec-A",
+          "name": "A",
+          "cx": 1.0355106081933303,
+          "cy": -30.239250168909916,
+          "angleDeg": 29.54875582536665,
+          "flipped": false,
+          "enabled": true,
+          "projDepth": 18
+        }
+      ],
+      "activePlaneId": "sec-A"
+    }
+  ],
+  "nextGroupNum": 1,
+  "nextZOrder": 4
+}

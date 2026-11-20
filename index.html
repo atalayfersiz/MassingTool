@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GROUNDWORK · Kotagiri Spatial &amp; Earthwork Studio</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Top Minimalist Header -->
+    <header class="topbar">
+      <div class="bar-group">
+        <div class="brand">
+          <span class="brand-title">GROUNDWORK</span>
+          <span class="brand-sub">Kotagiri</span>
+        </div>
+        <div class="sep"></div>
+        <div class="segmented" id="layoutSwitch">
+          <button class="seg-btn active" data-layout="split" title="Split View: Plan + 3D + Live Section (1)">Split</button>
+          <button class="seg-btn" data-layout="plan" title="Plan Bubble Diagram (2)">Plan</button>
+          <button class="seg-btn" data-layout="3d" title="3D Site &amp; Earthwork (3)">3D</button>
+          <button class="seg-btn" data-layout="section" title="Live Section View (4)">Section</button>
+        </div>
+        <div class="sep"></div>
+        <div class="segmented" id="toolSwitch">
+          <button class="seg-btn active" data-tool="select" title="Select, Move, Resize, Edit Height (V)">Select</button>
+          <button class="seg-btn" data-tool="dimension" title="Measure distance &amp; elevation across Plan, 3D, Section (D)">Dimension</button>
+          <button class="seg-btn" data-tool="section" title="Draw or move Section Clipping Plane on Plan (C)">Section Plane</button>
+        </div>
+      </div>
+
+      <div class="bar-group">
+        <button class="btn subtle" id="btnGroup" title="Group selected spaces (G)">Group</button>
+        <button class="btn subtle" id="btnUngroup" title="Ungroup selected spaces (Shift+G)">Ungroup</button>
+        <button class="btn subtle" id="btnGross" title="Toggle Net vs +32% Gross building area (N)">Net Area</button>
+        <button class="btn subtle" id="btnClearDims" title="Clear all dimensions">Clear Dims</button>
+        <div class="sep"></div>
+        <button class="btn subtle" id="btnUndo" title="Undo (Ctrl+Z)">Undo</button>
+        <button class="btn subtle" id="btnRedo" title="Redo (Ctrl+Y)">Redo</button>
+      </div>
+
+      <div class="bar-group">
+        <div class="metrics-pill" id="globalMetrics">
+          <span id="mPlaced">0 / 983 m²</span>
+          <span class="m-cut" id="mCut">Cut 0 m³</span>
+          <span class="m-fill" id="mFill">Fill 0 m³</span>
+          <span class="m-bal" id="mNet">Net 0 m³</span>
+        </div>
+
+        <button class="btn subtle" id="btnTheme" title="Toggle Light / Dark theme (M)">Dark</button>
+        <button class="btn subtle" id="btnShortcuts" title="Keyboard shortcuts (?)" style="padding:3px 7px;">?</button>
+        <button class="btn" id="btnExportMenu" title="Project &amp; Export menu (Ctrl+S)">Project / Export</button>
+        <input type="file" id="fileLoadJson" accept=".json" style="display:none;" />
+
+        <button class="btn active" id="btnToggleSidebar" title="Toggle Inspector sidebar (I)">Inspector</button>
+      </div>
+    </header>
+
+    <!-- Top Program Dock -->
+    <section class="program-dock" id="programDock">
+      <div class="dock-head">
+        <div class="dock-title-row">
+          <strong style="color:var(--ink);font-weight:600;">Program (Roombook)</strong>
+          <span>Click or drag a space onto the site</span>
+        </div>
+        <div class="bar-group">
+          <span style="font-size:10.5px;color:var(--ink-muted);">Sort:</span>
+          <div class="segmented" id="dockSortSwitch">
+            <button class="seg-btn active" data-sort="program">Program</button>
+            <button class="seg-btn" data-sort="relevance">Relevance</button>
+            <button class="seg-btn" data-sort="area">Area</button>
+          </div>
+          <button class="btn subtle" id="btnCollapseDock" style="padding:2px 6px;">Hide</button>
+        </div>
+      </div>
+      <div class="dock-chips" id="dockChips"></div>
+    </section>
+
+    <!-- Main Workspace -->
+    <main class="workspace">
+      <div class="viewports-area mode-split" id="viewportsArea">
+        <!-- Plan Viewport -->
+        <div class="viewport vp-plan" id="vpPlan">
+          <canvas class="vp-canvas" id="planCanvas"></canvas>
+          <div class="vp-hud">
+            <div class="vp-tag">
+              <span>Plan · Bubble Diagram</span>
+              <span style="color:var(--ink-muted);font-weight:400;">Stretch edges (area-locked) · Rotate · Drag near to merge keywords</span>
+            </div>
+            <div class="vp-controls">
+              <button class="vp-btn" id="btnShowDock" style="display:none;" title="Show Program Bar (B)">Program Bar</button>
+              <button class="vp-btn" id="btnPlanFit" title="Fit Site (F)">Fit Site</button>
+            </div>
+          </div>
+          <div class="vp-bottom-hud">
+            <div class="vp-readout" id="cursorReadout">X: 0.0 m · Y: 0.0 m · Ground Z: — m</div>
+          </div>
+        </div>
+
+        <!-- 3D Viewport -->
+        <div class="viewport vp-3d" id="vp3d">
+          <div id="view3dContainer" style="width:100%;height:100%;position:relative;">
+            <div class="labels-3d-layer" id="labels3dLayer"></div>
+          </div>
+          <div class="vp-hud">
+            <div class="vp-tag">
+              <span>3D Site &amp; Earthwork</span>
+              <span style="color:var(--ink-muted);font-weight:400;">Click space for XYZ gizmo</span>
+            </div>
+            <div class="vp-controls">
+              <button class="vp-btn" id="btn3dTranslucent" title="Toggle Translucent Ground (T)">Translucent Ground</button>
+              <button class="vp-btn active" id="btn3dClipToggle" title="Toggle 3D Clipping Plane (Shift+C)">Clip Plane</button>
+              <button class="vp-btn" id="btn3dFit" title="Fit 3D Site (F)">Fit 3D</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Live Section Viewport -->
+        <div class="viewport vp-section" id="vpSection">
+          <canvas class="vp-canvas" id="sectionCanvas"></canvas>
+          <div class="vp-hud">
+            <div class="vp-tag">
+              <span id="secHudTitle">Section A–A'</span>
+              <span style="color:var(--ink-muted);font-weight:400;">Drag top handle to edit height · Drag body to adjust Z / slope</span>
+            </div>
+            <div class="vp-controls">
+              <div id="secQuickTabs" style="display:inline-flex;gap:2px;"></div>
+              <button class="vp-btn" id="btnSecFlip" title="Flip Section Direction (X)">Flip</button>
+              <button class="vp-btn" id="btnSecFit" title="Fit Section (F)">Fit Section</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Inspector Sidebar -->
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-tabs" id="sidebarTabs">
+          <button class="tab-btn active" data-tab="selected">Selected</button>
+          <button class="tab-btn" data-tab="keywords">Keywords</button>
+          <button class="tab-btn" data-tab="sections">Sections &amp; Layers</button>
+          <button class="tab-btn" data-tab="iterations">Iterations</button>
+        </div>
+        <div class="sidebar-body" id="sidebarBody"></div>
+      </aside>
+    </main>
+  </div>
+
+  <!-- Centered Project / Export Pop-up Modal -->
+  <div class="modal-backdrop" id="projectModal" role="dialog" aria-modal="true" aria-labelledby="projectModalTitle">
+    <div class="modal-card">
+      <div class="modal-head">
+        <span class="modal-title" id="projectModalTitle">Project &amp; Export</span>
+        <button class="btn subtle" id="btnCloseProjectModal" style="padding:2px 8px;">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-group">
+          <div class="modal-group-title">Project File &amp; Iterations</div>
+          <div class="modal-grid">
+            <button class="modal-action" id="actSaveJson">
+              <strong>Save Project (.json)</strong>
+              <span>Download editable workspace</span>
+            </button>
+            <button class="modal-action" id="actLoadJson">
+              <strong>Load Project (.json)</strong>
+              <span>Restore saved file</span>
+            </button>
+            <button class="modal-action" id="actSaveIteration" style="grid-column:span 2;">
+              <strong>Save Iteration Snapshot</strong>
+              <span>Store current layout &amp; earthwork in Iterations tab</span>
+            </button>
+          </div>
+        </div>
+        <div class="modal-group">
+          <div class="modal-group-title">Export Diagrams</div>
+          <div class="modal-grid">
+            <button class="modal-action" id="actExportPng">
+              <strong>Export PNG Snapshot</strong>
+              <span>Current view or full Split board</span>
+            </button>
+            <button class="modal-action" id="actExportPlanSvg">
+              <strong>Export Plan SVG</strong>
+              <span>Vector bubble diagram &amp; site</span>
+            </button>
+            <button class="modal-action" id="actExportSectionSvg" style="grid-column:span 2;">
+              <strong>Export Section SVG</strong>
+              <span>Vector slope cut with soil volumes</span>
+            </button>
+          </div>
+        </div>
+        <div class="modal-group">
+          <div class="modal-group-title">Board Presets</div>
+          <div class="modal-grid">
+            <button class="modal-action" id="actStarterLayout">
+              <strong>Place Starter Program</strong>
+              <span>Auto-arrange all 23 spaces on slope</span>
+            </button>
+            <button class="modal-action danger" id="actClearBoard">
+              <strong>Clear Board (Blank)</strong>
+              <span>Reset site to empty state</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Centered Keyboard Shortcuts Reference Modal -->
+  <div class="modal-backdrop" id="shortcutsModal" role="dialog" aria-modal="true" aria-labelledby="shortcutsModalTitle">
+    <div class="modal-card">
+      <div class="modal-head">
+        <span class="modal-title" id="shortcutsModalTitle">Keyboard Shortcuts</span>
+        <button class="btn subtle" id="btnCloseShortcutsModal" style="padding:2px 8px;">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="shortcut-cols">
+          <div class="modal-group">
+            <div class="modal-group-title">Tools &amp; Views</div>
+            <div class="shortcut-list">
+              <div class="shortcut-row"><span>Select / Move</span><span class="kbd">V</span></div>
+              <div class="shortcut-row"><span>Dimension tool</span><span class="kbd">D</span></div>
+              <div class="shortcut-row"><span>Section Plane tool</span><span class="kbd">C</span></div>
+              <div class="shortcut-row"><span>Toggle 3D Clipping</span><span class="kbd">Shift + C</span></div>
+              <div class="shortcut-row"><span>Flip Section direction</span><span class="kbd">X</span></div>
+              <div class="shortcut-row"><span>Split / Plan / 3D / Section</span><span class="kbd">1 – 4</span></div>
+              <div class="shortcut-row"><span>Fit Site across views</span><span class="kbd">F</span></div>
+              <div class="shortcut-row"><span>Translucent Ground (3D)</span><span class="kbd">T</span></div>
+              <div class="shortcut-row"><span>Net / +32% Gross area</span><span class="kbd">N</span></div>
+              <div class="shortcut-row"><span>Dark / Light mode</span><span class="kbd">M</span></div>
+              <div class="shortcut-row"><span>Inspector / Program bar</span><span class="kbd">I / B</span></div>
+            </div>
+          </div>
+          <div class="modal-group">
+            <div class="modal-group-title">Space Editing &amp; Project</div>
+            <div class="shortcut-list">
+              <div class="shortcut-row"><span>Group / Ungroup</span><span class="kbd">G / Shift+G</span></div>
+              <div class="shortcut-row"><span>Snap Base Z to slope</span><span class="kbd">Z</span></div>
+              <div class="shortcut-row"><span>Rotate -15° / +15°</span><span class="kbd">Q / E</span></div>
+              <div class="shortcut-row"><span>Floor height -0.2 / +0.2m</span><span class="kbd">[ / ]</span></div>
+              <div class="shortcut-row"><span>Remove selected space</span><span class="kbd">Del</span></div>
+              <div class="shortcut-row"><span>Cancel / Select mode</span><span class="kbd">Esc</span></div>
+              <div class="shortcut-row"><span>Pan (Plan &amp; Section)</span><span class="kbd">Space + Drag</span></div>
+              <div class="shortcut-row"><span>Undo / Redo</span><span class="kbd">Ctrl + Z / Y</span></div>
+              <div class="shortcut-row"><span>Project &amp; Export menu</span><span class="kbd">Ctrl + S</span></div>
+              <div class="shortcut-row"><span>Shortcuts reference</span><span class="kbd">?</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <!-- Scripts loaded classically for zero-setup file:// compatibility -->
+  <script src="vendor/three.min.js"></script>
+  <script src="vendor/OrbitControls.js"></script>
+  <script src="vendor/TransformControls.js"></script>
+  <script src="site-data.js"></script>
+  <script src="program-data.js"></script>
+  <script src="engine-earthwork.js"></script>
+  <script src="view-plan.js"></script>
+  <script src="view-3d.js"></script>
+  <script src="view-section.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
