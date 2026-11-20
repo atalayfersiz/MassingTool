@@ -62,9 +62,14 @@
       this._boxDrag = null;
 
       this.volumeGroups = new Map();
+      this.terrainModGroups = new Map();
+      this.circGroups = new Map();
       this.terrainModPickers = [];
       this.circPickers = [];
+      this.activeCircLiftEnd = null;
+      this.circEndProxy = new THREE.Object3D();
       this.earthworkGroup = new THREE.Group();
+      this.terrainCutPatchGroup = new THREE.Group();
       this.terrainModGroup = new THREE.Group();
       this.circulationGroup = new THREE.Group();
       this.snapGuideGroup = new THREE.Group();
@@ -76,12 +81,14 @@
       this._setupLights();
       this._buildSiteEnvironment();
       this._buildClipFrame();
+      this.scene.add(this.terrainCutPatchGroup);
       this.scene.add(this.terrainModGroup);
       this.scene.add(this.circulationGroup);
       this.scene.add(this.earthworkGroup);
       this.scene.add(this.snapGuideGroup);
       this.scene.add(this.rainGroup);
       this.scene.add(this.dimGroup);
+      this.scene.add(this.circEndProxy);
 
       this._bindEvents();
       this._animate();
@@ -155,10 +162,11 @@
         }
       }
 
+      this._baseTerrainIndices = new Uint32Array(indices);
       const geom = new THREE.BufferGeometry();
       geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
       geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-      geom.setIndex(indices);
+      geom.setIndex(new THREE.Uint32BufferAttribute(this._baseTerrainIndices, 1));
       geom.computeVertexNormals();
 
       this.terrainMat = new THREE.MeshStandardMaterial({
@@ -417,7 +425,7 @@
       const ver = eng.getTerrainVersion ? eng.getTerrainVersion() : 0;
       if (this._syncedTerrainVersion === ver || !this.terrainMesh) return;
       this._syncedTerrainVersion = ver;
-      const zArr = eng.getGradedHeightfieldZ();
+      const zArr = eng.getPadHeightfieldZ ? eng.getPadHeightfieldZ() : eng.getGradedHeightfieldZ();
       if (!zArr) return;
       const hf = this.site.heightfield;
       const posAttr = this.terrainMesh.geometry.attributes.position;
@@ -426,7 +434,9 @@
       const colArr = colAttr.array;
       const zMin = this.site.meta.zMin;
       const zSpan = Math.max(1, this.site.meta.zMax - zMin);
-      const total = hf.nx * hf.ny;
+      const nx = hf.nx;
+      const ny = hf.ny;
+      const total = nx * ny;
       for (let i = 0; i < total; i++) {
         const wz = zArr[i];
         posArr[i * 3 + 1] = wz - this.zDatum;
@@ -437,7 +447,228 @@
       }
       posAttr.needsUpdate = true;
       colAttr.needsUpdate = true;
+
+      while (this.terrainCutPatchGroup.children.length) {
+        const ch = this.terrainCutPatchGroup.children.pop();
+        if (ch.geometry) ch.geometry.dispose();
+      }
+
+      const cutouts = eng.getActiveCircCutouts ? eng.getActiveCircCutouts() : [];
+      if (cutouts.length === 0) {
+        if (this._terrainIndexFiltered && this._baseTerrainIndices) {
+          this.terrainMesh.geometry.setIndex(new THREE.Uint32BufferAttribute(this._baseTerrainIndices, 1));
+          this._terrainIndexFiltered = false;
+        }
+        this.terrainMesh.geometry.computeVertexNormals();
+        return;
+      }
+
+      // Skip heightfield cells overlapping any cutout AABB and rebuild exact clipped sub-triangles + trench banks
+      const nCellsX = nx - 1;
+      const nCellsY = ny - 1;
+      const cellMarked = new Uint8Array(nCellsX * nCellsY);
+      const cs = hf.cellSize;
+      for (const c of cutouts) {
+        const bb = c.bbox;
+        if (!bb) continue;
+        const ix0 = Math.max(0, Math.floor((bb.minX - 0.05 - hf.minX) / cs));
+        const ix1 = Math.min(nCellsX - 1, Math.floor((bb.maxX + 0.05 - hf.minX) / cs));
+        const iy0 = Math.max(0, Math.floor((bb.minY - 0.05 - hf.minY) / cs));
+        const iy1 = Math.min(nCellsY - 1, Math.floor((bb.maxY + 0.05 - hf.minY) / cs));
+        for (let iy = iy0; iy <= iy1; iy++) {
+          const row = iy * nCellsX;
+          for (let ix = ix0; ix <= ix1; ix++) {
+            cellMarked[row + ix] = 1;
+          }
+        }
+      }
+
+      const filteredIndices = [];
+      for (let iy = 0; iy < nCellsY; iy++) {
+        const cRow = iy * nCellsX;
+        const vRow = iy * nx;
+        for (let ix = 0; ix < nCellsX; ix++) {
+          if (cellMarked[cRow + ix]) continue;
+          const a = vRow + ix;
+          const b = a + 1;
+          const c = (iy + 1) * nx + ix + 1;
+          const d = (iy + 1) * nx + ix;
+          filteredIndices.push(a, b, c, a, c, d);
+        }
+      }
+      this.terrainMesh.geometry.setIndex(filteredIndices);
+      this._terrainIndexFiltered = true;
       this.terrainMesh.geometry.computeVertexNormals();
+
+      const clipHalfPlane = (poly, fn, sign) => {
+        const out = [];
+        const n = poly.length;
+        if (n < 3) return out;
+        const EPS = 1e-6;
+        for (let i = 0; i < n; i++) {
+          const a = poly[i];
+          const b = poly[(i + 1) % n];
+          const fa = fn(a) * sign;
+          const fb = fn(b) * sign;
+          const inA = fa >= -EPS;
+          const inB = fb >= -EPS;
+          if (inA && inB) {
+            out.push(b);
+          } else if (inA && !inB) {
+            const denom = fa - fb;
+            const t = Math.max(0, Math.min(1, Math.abs(denom) > 1e-9 ? fa / denom : 0.5));
+            out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+          } else if (!inA && inB) {
+            const denom = fa - fb;
+            const t = Math.max(0, Math.min(1, Math.abs(denom) > 1e-9 ? fa / denom : 0.5));
+            out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+            out.push(b);
+          }
+        }
+        const clean = [];
+        for (const p of out) {
+          if (!clean.length || Math.hypot(p[0] - clean[clean.length - 1][0], p[1] - clean[clean.length - 1][1]) > 1e-4) {
+            clean.push(p);
+          }
+        }
+        if (clean.length >= 2 && Math.hypot(clean[0][0] - clean[clean.length - 1][0], clean[0][1] - clean[clean.length - 1][1]) <= 1e-4) {
+          clean.pop();
+        }
+        return clean;
+      };
+
+      const splitConvexByCutout = (poly, co) => {
+        const planes = [
+          (p) => co.halfL - ((p[0] - co.x) * co.cos + (p[1] - co.y) * co.sin),
+          (p) => ((p[0] - co.x) * co.cos + (p[1] - co.y) * co.sin) + co.halfL,
+          (p) => co.halfW - (-(p[0] - co.x) * co.sin + (p[1] - co.y) * co.cos),
+          (p) => (-(p[0] - co.x) * co.sin + (p[1] - co.y) * co.cos) + co.halfW
+        ];
+        let rem = poly;
+        const outside = [];
+        for (const fn of planes) {
+          const pos = clipHalfPlane(rem, fn, +1);
+          const neg = clipHalfPlane(rem, fn, -1);
+          if (neg.length >= 3) outside.push(neg);
+          rem = pos;
+          if (rem.length < 3) break;
+        }
+        return { inside: rem.length >= 3 ? rem : null, outside };
+      };
+
+      const patchPos = [];
+      const patchCol = [];
+      const pushTri = (ax, ay, az, bx, by, bz, cx3, cy3, cz3, darkFactor = 1.0) => {
+        const pushVert = (vx, wz, vy) => {
+          patchPos.push(vx, wz - this.zDatum, -vy);
+          const t = Math.max(0, Math.min(1, (wz - zMin) / zSpan));
+          patchCol.push((0.76 + t * 0.14) * darkFactor, (0.76 + t * 0.11) * darkFactor, (0.69 + t * 0.11) * darkFactor);
+        };
+        pushVert(ax, ay, az);
+        pushVert(bx, by, bz);
+        pushVert(cx3, cy3, cz3);
+      };
+
+      for (let iy = 0; iy < nCellsY; iy++) {
+        const cRow = iy * nCellsX;
+        for (let ix = 0; ix < nCellsX; ix++) {
+          if (!cellMarked[cRow + ix]) continue;
+          const x0 = hf.minX + ix * cs;
+          const x1 = x0 + cs;
+          const y0 = hf.minY + iy * cs;
+          const y1 = y0 + cs;
+
+          const hitIndices = [];
+          for (let ci = 0; ci < cutouts.length; ci++) {
+            const bb = cutouts[ci].bbox;
+            if (x1 >= bb.minX - 0.05 && x0 <= bb.maxX + 0.05 && y1 >= bb.minY - 0.05 && y0 <= bb.maxY + 0.05) {
+              hitIndices.push(ci);
+            }
+          }
+          let pieces = [{ poly: [[x0, y0], [x1, y0], [x1, y1], [x0, y1]], ciList: [] }];
+          for (const ci of hitIndices) {
+            const nextPieces = [];
+            for (const pc of pieces) {
+              const sp = splitConvexByCutout(pc.poly, cutouts[ci]);
+              for (const op of sp.outside) nextPieces.push({ poly: op, ciList: pc.ciList });
+              if (sp.inside) nextPieces.push({ poly: sp.inside, ciList: [...pc.ciList, ci] });
+            }
+            pieces = nextPieces;
+          }
+
+          for (const pc of pieces) {
+            const poly = pc.poly;
+            if (poly.length < 3) continue;
+            const zList = poly.map(([px, py]) => {
+              let z = eng.getPadGroundZ(px, py);
+              for (const ci of pc.ciList) {
+                const co = cutouts[ci];
+                const u = (px - co.x) * co.cos + (py - co.y) * co.sin;
+                const cutZ = co.soffitZAtU(u) - 0.04;
+                if (cutZ < z) z = cutZ;
+              }
+              return z;
+            });
+            const shade = pc.ciList.length > 0 ? 0.88 : 1.0;
+            for (let k = 1; k < poly.length - 1; k++) {
+              pushTri(
+                poly[0][0], zList[0], poly[0][1],
+                poly[k][0], zList[k], poly[k][1],
+                poly[k + 1][0], zList[k + 1], poly[k + 1][1],
+                shade
+              );
+            }
+          }
+        }
+      }
+
+      // Vertical cut-bank skirts along each excavated cutout perimeter where padZ > soffitZ
+      for (const co of cutouts) {
+        const hl = co.halfL;
+        const hw = co.halfW;
+        const nU = Math.max(4, Math.ceil(co.length / 0.5));
+        const nV = Math.max(2, Math.ceil(co.width / 0.5));
+        const toW = (u, v) => ({ x: co.x + u * co.cos - v * co.sin, y: co.y + u * co.sin + v * co.cos });
+        const addEdgeStrip = (samples) => {
+          for (let k = 0; k < samples.length - 1; k++) {
+            const a = samples[k], b = samples[k + 1];
+            const wa = toW(a.u, a.v), wb = toW(b.u, b.v);
+            const zTopA = eng.getPadGroundZ(wa.x, wa.y);
+            const zTopB = eng.getPadGroundZ(wb.x, wb.y);
+            const zBotA = co.soffitZAtU(a.u) - 0.04;
+            const zBotB = co.soffitZAtU(b.u) - 0.04;
+            if (zTopA <= zBotA + 0.02 && zTopB <= zBotB + 0.02) continue;
+            const za0 = Math.min(zTopA, zBotA), zb0 = Math.min(zTopB, zBotB);
+            pushTri(wa.x, za0, wa.y, wb.x, zb0, wb.y, wb.x, zTopB, wb.y, 0.82);
+            pushTri(wa.x, za0, wa.y, wb.x, zTopB, wb.y, wa.x, zTopA, wa.y, 0.82);
+          }
+        };
+        const sSide = [], nSide = [], wEnd = [], eEnd = [];
+        for (let i = 0; i <= nU; i++) {
+          const u = -hl + (2 * hl) * (i / nU);
+          sSide.push({ u, v: -hw });
+          nSide.push({ u, v: hw });
+        }
+        for (let i = 0; i <= nV; i++) {
+          const v = -hw + (2 * hw) * (i / nV);
+          wEnd.push({ u: -hl, v });
+          eEnd.push({ u: hl, v });
+        }
+        addEdgeStrip(sSide);
+        addEdgeStrip(nSide.reverse());
+        addEdgeStrip(wEnd);
+        addEdgeStrip(eEnd.reverse());
+      }
+
+      if (patchPos.length > 0) {
+        const pGeom = new THREE.BufferGeometry();
+        pGeom.setAttribute('position', new THREE.Float32BufferAttribute(patchPos, 3));
+        pGeom.setAttribute('color', new THREE.Float32BufferAttribute(patchCol, 3));
+        pGeom.computeVertexNormals();
+        const pMesh = new THREE.Mesh(pGeom, this.terrainMat);
+        pMesh.receiveShadow = true;
+        this.terrainCutPatchGroup.add(pMesh);
+      }
     }
 
     fitSite() {
@@ -469,13 +700,39 @@
           const obj = this.transform.object;
           if (obj && obj.userData.itemKind === 'terrain') {
             const mod = (state.terrainMods || []).find(m => m.id === obj.userData.itemId);
+            const siteTools = window.GROUNDWORK_SITE_TOOLS;
+            const ew = mod ? siteTools.computeTerrainModEarthwork(mod) : null;
+            const obb = mod ? siteTools.getTerrainModOBB(mod) : null;
+            const padZ = mod ? (mod.mode === 'offset' ? (ew.avgOrigZ + (mod.deltaZ || 0)) : mod.targetZ) : 1975;
             this.transformOrig = mod ? {
               itemKind: 'terrain',
               itemId: mod.id,
-              origY: obj.position.y,
+              origGrpX: obj.position.x,
+              origGrpPosY: obj.position.y,
+              origGrpY: -obj.position.z,
+              origCx: ew.cx,
+              origCy: ew.cy,
+              origPadZ: padZ,
+              origW: obb.w,
+              origD: obb.d,
+              origRot: obb.rot,
+              origPts: mod.pts.map(p => ({ x: p.x, y: p.y })),
               origTargetZ: mod.targetZ,
               origDeltaZ: mod.deltaZ || 0,
               mode: mod.mode
+            } : null;
+          } else if (obj === this.circEndProxy && this.activeCircLiftEnd) {
+            const circ = (state.circulations || []).find(c => c.id === this.activeCircLiftEnd.circId);
+            const prof = circ ? window.GROUNDWORK_SITE_TOOLS.computeCirculationProfile(circ, state.volumes, state.useGross) : null;
+            this.transformOrig = (circ && prof) ? {
+              itemKind: 'circ-end-lift',
+              circId: circ.id,
+              end: this.activeCircLiftEnd.end,
+              origProxyY: obj.position.y,
+              origZ: this.activeCircLiftEnd.end === 'start' ? prof.zStart : prof.zEnd,
+              baseZ: this.activeCircLiftEnd.end === 'start' ? prof.baseStartZ : prof.baseEndZ,
+              endPt: this.activeCircLiftEnd.end === 'start' ? prof.startPt : prof.endPt,
+              autoTerrainZ: circ.autoTerrainZ
             } : null;
           } else if (obj && obj.userData.itemKind === 'circulation') {
             const circ = (state.circulations || []).find(c => c.id === obj.userData.itemId);
@@ -508,6 +765,7 @@
         } else {
           this.transformOrig = null;
           this._clearSnapGuides();
+          this.syncFromState();
           this.focusSelection();
         }
       });
@@ -517,12 +775,95 @@
         const grp = this.transform.object;
         const state = this.api.getState();
         const eng = window.GROUNDWORK_ENGINE;
+        const siteTools = window.GROUNDWORK_SITE_TOOLS;
+
+        if (this.transformOrig.itemKind === 'circ-end-lift') {
+          const dy = grp.position.y - this.transformOrig.origProxyY;
+          let newZ = this.transformOrig.origZ + dy;
+          if (state.layers.snap !== false && !this._altHeld) {
+            const tolZ = 0.45;
+            let bestZ = null;
+            let bestErr = tolZ;
+            const tryTarget = (tz, xRef, yRef) => {
+              const err = Math.abs(newZ - tz);
+              if (err < bestErr) { bestErr = err; bestZ = { z: tz, x: xRef, y: yRef }; }
+            };
+            const ep = this.transformOrig.endPt;
+            tryTarget(this.transformOrig.baseZ, ep.x, ep.y);
+            for (const v of state.volumes) {
+              const d = eng.getEffectiveDims(v, state.useGross);
+              tryTarget(v.zBase, v.x, v.y);
+              tryTarget(v.zBase + d.totalHeight, v.x, v.y);
+            }
+            for (const m of (state.terrainMods || [])) {
+              const st = siteTools.getPolygonStats(m.pts);
+              const pz = m.mode === 'offset' ? st.avgOrigZ + (m.deltaZ || 0) : m.targetZ;
+              tryTarget(pz, st.cx, st.cy);
+            }
+            this._clearSnapGuides();
+            if (bestZ) {
+              newZ = Math.round(bestZ.z * 100) / 100;
+              grp.position.y = newZ - this.zDatum;
+              const mat = new THREE.LineBasicMaterial({ color: state.theme === 'dark' ? 0xe07b5f : 0xb85d43 });
+              const pts = [
+                this.toThree(ep.x, ep.y, newZ),
+                this.toThree(bestZ.x === ep.x && bestZ.y === ep.y ? ep.x + 4 : bestZ.x, bestZ.x === ep.x && bestZ.y === ep.y ? ep.y : bestZ.y, newZ)
+              ];
+              this.snapGuideGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat));
+            }
+          } else {
+            this._clearSnapGuides();
+          }
+          const lift = Math.round((newZ - this.transformOrig.baseZ) * 100) / 100;
+          const patch = this.transformOrig.end === 'start'
+            ? (this.transformOrig.autoTerrainZ ? { startLift: lift } : { startLift: lift, zStart: Math.round(newZ * 100) / 100 })
+            : (this.transformOrig.autoTerrainZ ? { endLift: lift } : { endLift: lift, zEnd: Math.round(newZ * 100) / 100 });
+          this.api.updateCirculation(this.transformOrig.circId, patch, { silentUndo: true, skip3DTransformSync: true });
+          return;
+        }
 
         if (this.transformOrig.itemKind === 'terrain') {
-          const dy = grp.position.y - this.transformOrig.origY;
-          const patch = this.transformOrig.mode === 'offset'
-            ? { deltaZ: Math.round((this.transformOrig.origDeltaZ + dy) * 100) / 100 }
-            : { targetZ: Math.round((this.transformOrig.origTargetZ + dy) * 100) / 100 };
+          let dx = grp.position.x - this.transformOrig.origGrpX;
+          let dy = (-grp.position.z) - this.transformOrig.origGrpY;
+          let dz = grp.position.y - this.transformOrig.origGrpPosY;
+          const rawCx = this.transformOrig.origCx + dx;
+          const rawCy = this.transformOrig.origCy + dy;
+          let newPadZ = this.transformOrig.origPadZ + dz;
+
+          if (state.layers.snap !== false && !this._altHeld) {
+            const shiftedTmp = this.transformOrig.origPts.map(p => ({ x: p.x + dx, y: p.y + dy }));
+            const avgTmp = siteTools.getPolygonStats(shiftedTmp).avgOrigZ;
+            const snap = this._compute3DSnap({
+              id: this.transformOrig.itemId,
+              x: rawCx,
+              y: rawCy,
+              w: this.transformOrig.origW,
+              d: this.transformOrig.origD,
+              rot: this.transformOrig.origRot,
+              zBase: newPadZ,
+              groundRefZ: avgTmp
+            }, new Set([this.transformOrig.itemId]), state, true);
+            dx += snap.dxSnap;
+            dy += snap.dySnap;
+            newPadZ = snap.snappedZBase;
+            dz = newPadZ - this.transformOrig.origPadZ;
+            grp.position.set(
+              this.transformOrig.origGrpX + dx,
+              this.transformOrig.origGrpPosY + dz,
+              -(this.transformOrig.origGrpY + dy)
+            );
+          } else {
+            this._clearSnapGuides();
+          }
+
+          const pts = this.transformOrig.origPts.map(p => ({ x: p.x + dx, y: p.y + dy }));
+          const patch = { pts };
+          if (this.transformOrig.mode === 'offset') {
+            const newAvgOrig = siteTools.getPolygonStats(pts).avgOrigZ;
+            patch.deltaZ = Math.round((newPadZ - newAvgOrig) * 100) / 100;
+          } else {
+            patch.targetZ = Math.round((this.transformOrig.origTargetZ + dz) * 100) / 100;
+          }
           this.api.updateTerrainMod(this.transformOrig.itemId, patch, { silentUndo: true, skip3DTransformSync: true });
           return;
         }
@@ -735,16 +1076,24 @@
         if (hits.length > 0) {
           const obj = hits[0].object;
           if (obj.userData.volId) {
+            this.activeCircLiftEnd = null;
             const volId = obj.userData.volId;
             if (e.shiftKey) this.api.toggleSelect(volId);
             else this.api.selectVolume(volId, e.detail < 2);
             this.focusSelection({ fitDistance: e.detail >= 2 });
+          } else if (obj.userData.itemKind === 'circ-end-lift') {
+            this.activeCircLiftEnd = { circId: obj.userData.itemId, end: obj.userData.end };
+            this.api.selectItem('circulation', obj.userData.itemId);
+            this.syncFromState();
           } else if (obj.userData.itemKind === 'circulation') {
+            this.activeCircLiftEnd = null;
             this.api.selectItem('circulation', obj.userData.itemId);
           } else if (obj.userData.itemKind === 'terrain') {
+            this.activeCircLiftEnd = null;
             this.api.selectItem('terrain', obj.userData.itemId);
           }
         } else if (!e.shiftKey) {
+          this.activeCircLiftEnd = null;
           this.api.clearSelection();
         }
       });
@@ -931,10 +1280,17 @@
       }
 
       // 3b. Rebuild Terrain Pads + Retaining Walls, and Parametric Ramps/Stairs
-      const modTargets = this._rebuildTerrainModMeshes(state, isDark);
-      const circTargets = this._rebuildCirculationMeshes(state, isDark);
+      const modTargets = this._rebuildTerrainModMeshes(state, isDark, opts);
+      const circTargets = this._rebuildCirculationMeshes(state, isDark, opts);
 
-      // Attach TransformControls to primary selected volume, circulation, or terrain pad
+      if (
+        this.activeCircLiftEnd &&
+        (!state.selectedItem || state.selectedItem.kind !== 'circulation' || state.selectedItem.id !== this.activeCircLiftEnd.circId)
+      ) {
+        this.activeCircLiftEnd = null;
+      }
+
+      // Attach TransformControls to primary selected volume, circulation (or endpoint lift pin), or terrain pad
       if (!this.isTransforming) {
         if (state.selectedIds.length > 0 && state.tool === 'select') {
           const targetGrp = this.volumeGroups.get(state.selectedIds[0]);
@@ -947,14 +1303,28 @@
         } else if (state.selectedItem && state.selectedItem.kind === 'terrain' && modTargets.has(state.selectedItem.id)) {
           const tGrp = modTargets.get(state.selectedItem.id);
           if (!(opts.skip3DTransformSync && this.transform.object === tGrp)) {
-            this.transform.showX = false; this.transform.showY = true; this.transform.showZ = false;
+            this.transform.showX = true; this.transform.showY = true; this.transform.showZ = true;
             if (this.transform.object !== tGrp) this.transform.attach(tGrp);
           }
         } else if (state.selectedItem && state.selectedItem.kind === 'circulation' && circTargets.has(state.selectedItem.id)) {
-          const cGrp = circTargets.get(state.selectedItem.id);
-          if (!(opts.skip3DTransformSync && this.transform.object === cGrp)) {
-            this.transform.showX = true; this.transform.showY = true; this.transform.showZ = true;
-            if (this.transform.object !== cGrp) this.transform.attach(cGrp);
+          if (this.activeCircLiftEnd && this.activeCircLiftEnd.circId === state.selectedItem.id) {
+            const circ = (state.circulations || []).find(c => c.id === state.selectedItem.id);
+            const prof = circ ? window.GROUNDWORK_SITE_TOOLS.computeCirculationProfile(circ, state.volumes, state.useGross) : null;
+            if (prof) {
+              const ep = this.activeCircLiftEnd.end === 'start' ? prof.startPt : prof.endPt;
+              const ez = this.activeCircLiftEnd.end === 'start' ? prof.zStart : prof.zEnd;
+              if (!(opts.skip3DTransformSync && this.transform.object === this.circEndProxy)) {
+                this.circEndProxy.position.set(ep.x, ez - this.zDatum, -ep.y);
+              }
+              this.transform.showX = false; this.transform.showY = true; this.transform.showZ = false;
+              if (this.transform.object !== this.circEndProxy) this.transform.attach(this.circEndProxy);
+            }
+          } else {
+            const cGrp = circTargets.get(state.selectedItem.id);
+            if (!(opts.skip3DTransformSync && this.transform.object === cGrp)) {
+              this.transform.showX = true; this.transform.showY = true; this.transform.showZ = true;
+              if (this.transform.object !== cGrp) this.transform.attach(cGrp);
+            }
           }
         } else {
           this.transform.detach();
@@ -1437,10 +1807,12 @@
         }
       }
       for (const m of (state.terrainMods || [])) {
+        if (dragIds.has(m.id)) continue;
         if (m.pts && m.pts.length >= 3) {
+          const obb = siteTools.getTerrainModOBB(m);
           const st = siteTools.getPolygonStats(m.pts);
           const padZ = m.mode === 'offset' ? st.avgOrigZ + (m.deltaZ || 0) : m.targetZ;
-          targets.push({ id: m.id, x: (st.minX + st.maxX) * 0.5, y: (st.minY + st.maxY) * 0.5, w: st.maxX - st.minX, d: st.maxY - st.minY, rot: 0, zBase: padZ, zTop: padZ });
+          targets.push({ id: m.id, x: obb.cx, y: obb.cy, w: obb.w, d: obb.d, rot: obb.rot, zBase: padZ, zTop: padZ });
         }
       }
 
@@ -1506,7 +1878,7 @@
       let bestZLine = null;
       if (snapZ) {
         let bestZErr = zTol;
-        const gz = eng.getGroundZ(snapX, snapY);
+        const gz = item.groundRefZ !== undefined ? item.groundRefZ : eng.getGroundZ(snapX, snapY);
         if (Math.abs(item.zBase - gz) < bestZErr) {
           bestZErr = Math.abs(item.zBase - gz);
           snappedZBase = Math.round(gz * 100) / 100;
@@ -1628,33 +2000,53 @@
       }
     }
 
-    _rebuildTerrainModMeshes(state, isDark) {
-      while (this.terrainModGroup.children.length) {
-        const ch = this.terrainModGroup.children.pop();
-        ch.traverse(obj => {
-          if (obj.geometry) obj.geometry.dispose();
-          if (obj.material) obj.material.dispose();
-        });
-      }
+    _rebuildTerrainModMeshes(state, isDark, opts = {}) {
       this.terrainModPickers = [];
       const targetMap = new Map();
       const mods = state.terrainMods || [];
-      if (mods.length === 0) return targetMap;
+      const seenIds = new Set();
 
-      const eng = window.GROUNDWORK_ENGINE;
       const siteTools = window.GROUNDWORK_SITE_TOOLS;
       const wallCol = isDark ? 0x6c665d : 0x7c7466;
       const wallEdgeCol = isDark ? 0xa49d91 : 0x3b3832;
 
       for (const mod of mods) {
         if (!mod.pts || mod.pts.length < 3) continue;
+        seenIds.add(mod.id);
         const ew = siteTools.computeTerrainModEarthwork(mod);
         const isSel = !!(state.selectedItem && state.selectedItem.kind === 'terrain' && state.selectedItem.id === mod.id);
-        const grp = new THREE.Group();
         const padZ = mod.mode === 'offset' ? (ew.avgOrigZ + (mod.deltaZ || 0)) : mod.targetZ;
-        grp.position.set(ew.cx, padZ - this.zDatum, -ew.cy);
-        grp.userData.itemKind = 'terrain';
-        grp.userData.itemId = mod.id;
+
+        let grp = this.terrainModGroups.get(mod.id);
+        if (!grp) {
+          grp = new THREE.Group();
+          grp.userData.itemKind = 'terrain';
+          grp.userData.itemId = mod.id;
+          this.terrainModGroup.add(grp);
+          this.terrainModGroups.set(mod.id, grp);
+        }
+
+        while (grp.children.length) {
+          const ch = grp.children.pop();
+          ch.traverse(obj => {
+            if (obj.geometry) obj.geometry.dispose();
+            if (obj.material) obj.material.dispose();
+          });
+        }
+
+        const isHeldByGizmo = !!(opts.skip3DTransformSync && this.transform.object === grp);
+        if (!isHeldByGizmo) {
+          grp.position.set(ew.cx, padZ - this.zDatum, -ew.cy);
+        }
+        const visualSub = new THREE.Group();
+        if (isHeldByGizmo) {
+          visualSub.position.set(
+            ew.cx - grp.position.x,
+            (padZ - this.zDatum) - grp.position.y,
+            (-ew.cy) - grp.position.z
+          );
+        }
+        grp.add(visualSub);
 
         // Horizontal graded surface cap relative to centroid (so Y transform moves cap cleanly)
         try {
@@ -1681,89 +2073,96 @@
           capMesh.position.y = 0.05;
           capMesh.userData.itemKind = 'terrain';
           capMesh.userData.itemId = mod.id;
-          grp.add(capMesh);
+          visualSub.add(capMesh);
           this.terrainModPickers.push(capMesh);
         } catch (_) {}
 
-        // Retaining walls built directly along border segments relative to centroid
+        // Single monolithic retaining wall ribbon with sharp mitered corners
         if (mod.retainingWalls !== false) {
-          const wallMat = new THREE.MeshStandardMaterial({
-            color: isSel ? 0x9b5a46 : wallCol,
-            roughness: 0.85,
-            metalness: 0.04,
-            clippingPlanes: this.activeClipPlanes
-          });
-          const wallEdgeMat = new THREE.LineBasicMaterial({ color: isSel ? 0xf2eee6 : wallEdgeCol, clippingPlanes: this.activeClipPlanes });
-          const thick = mod.wallThickness || 0.35;
-          const parapet = mod.parapetHeight || 0;
-
-          for (let i = 0; i < mod.pts.length; i++) {
-            const a = mod.pts[i];
-            const b = mod.pts[(i + 1) % mod.pts.length];
-            const segLen = Math.hypot(b.x - a.x, b.y - a.y);
-            if (segLen < 0.1) continue;
-            const nSeg = Math.max(1, Math.min(20, Math.ceil(segLen / 1.5)));
-            const ds = segLen / nSeg;
-            const ang = Math.atan2(b.y - a.y, b.x - a.x);
-            for (let k = 0; k < nSeg; k++) {
-              const t = (k + 0.5) / nSeg;
-              const wx = a.x + (b.x - a.x) * t;
-              const wy = a.y + (b.y - a.y) * t;
-              const origZ = eng.getOriginalGroundZ(wx, wy);
-              const modZ = mod.mode === 'offset' ? (origZ + (mod.deltaZ || 0)) : mod.targetZ;
-              const zLow = Math.min(origZ, modZ) - 0.35;
-              const zHigh = Math.max(origZ, modZ) + parapet;
-              const wh = zHigh - zLow;
-              if (wh < 0.08) continue;
-              const wg = new THREE.BoxGeometry(ds + 0.04, wh, thick);
-              const wm = new THREE.Mesh(wg, wallMat);
-              wm.castShadow = true;
-              wm.receiveShadow = true;
-              wm.position.set(wx - ew.cx, (zLow + zHigh) * 0.5 - padZ, -(wy - ew.cy));
-              wm.rotation.y = ang;
-              wm.userData.itemKind = 'terrain';
-              wm.userData.itemId = mod.id;
-              grp.add(wm);
-              this.terrainModPickers.push(wm);
-              const we = new THREE.LineSegments(new THREE.EdgesGeometry(wg, 20), wallEdgeMat);
-              we.position.copy(wm.position);
-              we.rotation.copy(wm.rotation);
-              grp.add(we);
-            }
+          const wallData = siteTools.buildMonolithicRetainingWallData(mod);
+          if (wallData && wallData.positions.length > 0) {
+            const wallMat = new THREE.MeshStandardMaterial({
+              color: isSel ? 0x9b5a46 : wallCol,
+              roughness: 0.85,
+              metalness: 0.04,
+              side: THREE.DoubleSide,
+              clippingPlanes: this.activeClipPlanes
+            });
+            const wallEdgeMat = new THREE.LineBasicMaterial({ color: isSel ? 0xf2eee6 : wallEdgeCol, clippingPlanes: this.activeClipPlanes });
+            const wallGeom = new THREE.BufferGeometry();
+            wallGeom.setAttribute('position', new THREE.Float32BufferAttribute(wallData.positions, 3));
+            wallGeom.computeVertexNormals();
+            const wallMesh = new THREE.Mesh(wallGeom, wallMat);
+            wallMesh.castShadow = true;
+            wallMesh.receiveShadow = true;
+            wallMesh.userData = { itemKind: 'terrain', itemId: mod.id, part: 'retainingWall' };
+            visualSub.add(wallMesh);
+            this.terrainModPickers.push(wallMesh);
+            visualSub.add(new THREE.LineSegments(new THREE.EdgesGeometry(wallGeom, 20), wallEdgeMat));
           }
         }
 
-        this.terrainModGroup.add(grp);
         targetMap.set(mod.id, grp);
+      }
+
+      for (const [id, grp] of this.terrainModGroups.entries()) {
+        if (!seenIds.has(id)) {
+          if (this.transform.object === grp) this.transform.detach();
+          grp.traverse(obj => {
+            if (obj.geometry) obj.geometry.dispose();
+            if (obj.material) obj.material.dispose();
+          });
+          this.terrainModGroup.remove(grp);
+          this.terrainModGroups.delete(id);
+        }
       }
       return targetMap;
     }
 
-    _rebuildCirculationMeshes(state, isDark) {
-      while (this.circulationGroup.children.length) {
-        const ch = this.circulationGroup.children.pop();
-        ch.traverse(obj => {
-          if (obj.geometry) obj.geometry.dispose();
-          if (obj.material) obj.material.dispose();
-        });
-      }
+    _rebuildCirculationMeshes(state, isDark, opts = {}) {
       this.circPickers = [];
       const targetMap = new Map();
       const list = state.circulations || [];
-      if (list.length === 0) return targetMap;
+      const seenIds = new Set();
 
       const eng = window.GROUNDWORK_ENGINE;
       const siteTools = window.GROUNDWORK_SITE_TOOLS;
+      const endLiftPins = [];
+      const bodyMeshes = [];
 
       for (const circ of list) {
+        seenIds.add(circ.id);
         const prof = siteTools.computeCirculationProfile(circ, state.volumes, state.useGross);
         const isSel = !!(state.selectedItem && state.selectedItem.kind === 'circulation' && state.selectedItem.id === circ.id);
         const zMid = (prof.minZ + prof.maxZ) * 0.5;
-        const grp = new THREE.Group();
-        grp.position.set(circ.x, zMid - this.zDatum, -circ.y);
-        grp.rotation.y = circ.rot || 0;
-        grp.userData.itemKind = 'circulation';
-        grp.userData.itemId = circ.id;
+
+        let grp = this.circGroups.get(circ.id);
+        if (!grp) {
+          grp = new THREE.Group();
+          grp.userData.itemKind = 'circulation';
+          grp.userData.itemId = circ.id;
+          this.circulationGroup.add(grp);
+          this.circGroups.set(circ.id, grp);
+        }
+
+        while (grp.children.length) {
+          const ch = grp.children.pop();
+          ch.traverse(obj => {
+            if (obj.geometry) obj.geometry.dispose();
+            if (obj.material) obj.material.dispose();
+          });
+        }
+
+        const isHeldByGizmo = !!(opts.skip3DTransformSync && this.transform.object === grp);
+        if (!isHeldByGizmo) {
+          grp.position.set(circ.x, zMid - this.zDatum, -circ.y);
+          grp.rotation.y = circ.rot || 0;
+        }
+        const visualSub = new THREE.Group();
+        if (isHeldByGizmo) {
+          visualSub.position.set(0, (zMid - this.zDatum) - grp.position.y, 0);
+        }
+        grp.add(visualSub);
 
         const slabCol = circ.kind === 'stair' ? (isDark ? 0x6f8796 : 0xb8c5cf) : (isDark ? 0x8f7954 : 0xd4c2a1);
         const mat = new THREE.MeshStandardMaterial({
@@ -1796,8 +2195,11 @@
             sm.position.set(cu, (zBot + hStep * 0.5) - zMid, 0);
             sm.userData.itemKind = 'circulation';
             sm.userData.itemId = circ.id;
-            grp.add(sm);
-            this.circPickers.push(sm);
+            visualSub.add(sm);
+            bodyMeshes.push(sm);
+            const se = new THREE.LineSegments(new THREE.EdgesGeometry(sg, 22), edgeMat);
+            se.position.copy(sm.position);
+            visualSub.add(se);
           }
         } else if (prof.segments) {
           const pos = [];
@@ -1824,9 +2226,9 @@
           rm.receiveShadow = true;
           rm.userData.itemKind = 'circulation';
           rm.userData.itemId = circ.id;
-          grp.add(rm);
-          this.circPickers.push(rm);
-          grp.add(new THREE.LineSegments(new THREE.EdgesGeometry(rg, 18), edgeMat));
+          visualSub.add(rm);
+          bodyMeshes.push(rm);
+          visualSub.add(new THREE.LineSegments(new THREE.EdgesGeometry(rg, 18), edgeMat));
         }
 
         // Handrails (1.0m above surface)
@@ -1839,49 +2241,100 @@
             ptsL.push(new THREE.Vector3(u, yr, -hw + 0.06));
             ptsR.push(new THREE.Vector3(u, yr, hw - 0.06));
           }
-          grp.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(ptsL), edgeMat));
-          grp.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(ptsR), edgeMat));
+          visualSub.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(ptsL), edgeMat));
+          visualSub.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(ptsR), edgeMat));
           for (const uPost of [-circ.length * 0.5, 0, circ.length * 0.5]) {
             const yb = prof.surfaceZAtU(uPost) - zMid;
-            const postMat = edgeMat;
             for (const zSide of [-hw + 0.06, hw - 0.06]) {
               const pg = new THREE.BufferGeometry().setFromPoints([
                 new THREE.Vector3(uPost, yb, zSide),
                 new THREE.Vector3(uPost, yb + 1.0, zSide)
               ]);
-              grp.add(new THREE.Line(pg, postMat));
+              visualSub.add(new THREE.Line(pg, edgeMat));
             }
           }
         }
 
-        // Side cheek retaining skirts down to grade where exposed
+        // Side cheek retaining/support skirts sampling live pad grade at each station
         if (circ.sideWalls !== false) {
-          const gzStart = eng.getGroundZ(prof.startPt.x, prof.startPt.y);
-          const gzEnd = eng.getGroundZ(prof.endPt.x, prof.endPt.y);
-          const zUnderMin = Math.min(gzStart, gzEnd, prof.minZ - thick) - 0.25;
-          if (prof.maxZ - zUnderMin > 0.35) {
-            const underMat = new THREE.MeshStandardMaterial({ color: isDark ? 0x575249 : 0x9c9587, roughness: 0.9, clippingPlanes: this.activeClipPlanes });
-            for (const zSide of [-hw + 0.08, hw - 0.08]) {
-              const nStep = 8;
-              const swPos = [];
-              for (let i = 0; i < nStep; i++) {
-                const u0 = -circ.length * 0.5 + circ.length * (i / nStep);
-                const u1 = -circ.length * 0.5 + circ.length * ((i + 1) / nStep);
-                const yt0 = prof.surfaceZAtU(u0) - zMid;
-                const yt1 = prof.surfaceZAtU(u1) - zMid;
-                const yb = zUnderMin - zMid;
-                swPos.push(u0, yb, zSide, u1, yb, zSide, u1, yt1, zSide, u0, yb, zSide, u1, yt1, zSide, u0, yt0, zSide);
-              }
-              const sg = new THREE.BufferGeometry();
-              sg.setAttribute('position', new THREE.Float32BufferAttribute(swPos, 3));
-              sg.computeVertexNormals();
-              grp.add(new THREE.Mesh(sg, underMat));
+          const underMat = new THREE.MeshStandardMaterial({
+            color: isDark ? 0x575249 : 0x9c9587,
+            roughness: 0.9,
+            side: THREE.DoubleSide,
+            clippingPlanes: this.activeClipPlanes
+          });
+          const cRot = Math.cos(circ.rot || 0);
+          const sRot = Math.sin(circ.rot || 0);
+          const nStep = 12;
+          for (const vSide of [-hw + 0.06, hw - 0.06]) {
+            const swPos = [];
+            for (let i = 0; i < nStep; i++) {
+              const u0 = -circ.length * 0.5 + circ.length * (i / nStep);
+              const u1 = -circ.length * 0.5 + circ.length * ((i + 1) / nStep);
+              const wx0 = circ.x + u0 * cRot - (-vSide) * sRot;
+              const wy0 = circ.y + u0 * sRot + (-vSide) * cRot;
+              const wx1 = circ.x + u1 * cRot - (-vSide) * sRot;
+              const wy1 = circ.y + u1 * sRot + (-vSide) * cRot;
+              const gz0 = eng.getPadGroundZ(wx0, wy0);
+              const gz1 = eng.getPadGroundZ(wx1, wy1);
+              const soff0 = prof.soffitZAtU ? prof.soffitZAtU(u0) : prof.surfaceZAtU(u0) - thick;
+              const soff1 = prof.soffitZAtU ? prof.soffitZAtU(u1) : prof.surfaceZAtU(u1) - thick;
+              const top0 = Math.max(prof.surfaceZAtU(u0) + 0.04, gz0 > soff0 ? gz0 + 0.04 : soff0) - zMid;
+              const top1 = Math.max(prof.surfaceZAtU(u1) + 0.04, gz1 > soff1 ? gz1 + 0.04 : soff1) - zMid;
+              const bot0 = Math.min(gz0, soff0) - 0.25 - zMid;
+              const bot1 = Math.min(gz1, soff1) - 0.25 - zMid;
+              swPos.push(u0, bot0, vSide, u1, bot1, vSide, u1, top1, vSide, u0, bot0, vSide, u1, top1, vSide, u0, top0, vSide);
             }
+            const sg = new THREE.BufferGeometry();
+            sg.setAttribute('position', new THREE.Float32BufferAttribute(swPos, 3));
+            sg.computeVertexNormals();
+            visualSub.add(new THREE.Mesh(sg, underMat));
           }
         }
 
-        this.circulationGroup.add(grp);
+        // Start / End Lift pins when selected in 3D
+        if (isSel) {
+          for (const endInfo of [
+            { key: 'start', u: -circ.length * 0.5, zVal: prof.zStart },
+            { key: 'end', u: circ.length * 0.5, zVal: prof.zEnd }
+          ]) {
+            const isEndActive = !!(this.activeCircLiftEnd && this.activeCircLiftEnd.circId === circ.id && this.activeCircLiftEnd.end === endInfo.key);
+            const pinMat = new THREE.MeshStandardMaterial({
+              color: isEndActive ? 0xd96b43 : (endInfo.key === 'start' ? 0x4f7d99 : 0xc98a3b),
+              roughness: 0.4,
+              metalness: 0.1
+            });
+            const pinGeom = new THREE.ConeGeometry(0.28, 0.72, 12);
+            const pinMesh = new THREE.Mesh(pinGeom, pinMat);
+            const surfY = endInfo.zVal - zMid;
+            pinMesh.position.set(endInfo.u, surfY + 1.35, 0);
+            pinMesh.userData = { itemKind: 'circ-end-lift', itemId: circ.id, end: endInfo.key };
+            visualSub.add(pinMesh);
+            endLiftPins.push(pinMesh);
+
+            const stemG = new THREE.BufferGeometry().setFromPoints([
+              new THREE.Vector3(endInfo.u, surfY, 0),
+              new THREE.Vector3(endInfo.u, surfY + 1.15, 0)
+            ]);
+            visualSub.add(new THREE.Line(stemG, new THREE.LineBasicMaterial({ color: isEndActive ? 0xd96b43 : 0xb85d43 })));
+          }
+        }
+
         targetMap.set(circ.id, grp);
+      }
+
+      this.circPickers.push(...endLiftPins, ...bodyMeshes);
+
+      for (const [id, grp] of this.circGroups.entries()) {
+        if (!seenIds.has(id)) {
+          if (this.transform.object === grp) this.transform.detach();
+          grp.traverse(obj => {
+            if (obj.geometry) obj.geometry.dispose();
+            if (obj.material) obj.material.dispose();
+          });
+          this.circulationGroup.remove(grp);
+          this.circGroups.delete(id);
+        }
       }
       return targetMap;
     }

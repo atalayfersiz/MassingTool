@@ -1,6 +1,8 @@
 /* Geometric, Terrain, Earthwork Cut/Fill, and Clipping-Plane Section Engine */
 (function () {
   let _activeTerrainMods = [];
+  let _activeCircCutouts = [];
+  let _padGradedZ = null;
   let _gradedZ = null;
   let _terrainVersion = 0;
 
@@ -102,13 +104,74 @@
     return sampleHeightfieldArray(site.heightfield.z, site.heightfield, x, y);
   }
 
-  function getGroundZ(x, y) {
+  function getPadGroundZ(x, y) {
     const site = getSite();
     if (!site || !site.heightfield) return 1975.0;
     const hf = site.heightfield;
     const origZ = sampleHeightfieldArray(hf.z, hf, x, y);
     if (_activeTerrainMods.length === 0) return origZ;
     return _evalTerrainModsAt(x, y, origZ);
+  }
+
+  function getGroundZ(x, y) {
+    let z = getPadGroundZ(x, y);
+    if (_activeCircCutouts.length === 0) return z;
+    for (const c of _activeCircCutouts) {
+      const bb = c.bbox;
+      if (bb && (x < bb.minX || x > bb.maxX || y < bb.minY || y > bb.maxY)) continue;
+      const dx = x - c.x;
+      const dy = y - c.y;
+      const u = dx * c.cos + dy * c.sin;
+      const v = -dx * c.sin + dy * c.cos;
+      if (Math.abs(u) <= c.halfL && Math.abs(v) <= c.halfW) {
+        const sz = c.soffitZAtU(u);
+        if (Number.isFinite(sz) && sz < z) z = sz;
+      }
+    }
+    return z;
+  }
+
+  function _applyCutoutsToGradedZ() {
+    const site = getSite();
+    if (!site || !site.heightfield) {
+      _gradedZ = null;
+      return;
+    }
+    const hf = site.heightfield;
+    if (_activeTerrainMods.length === 0 && _activeCircCutouts.length === 0) {
+      _gradedZ = null;
+      return;
+    }
+    if (!_gradedZ || _gradedZ.length !== hf.z.length) {
+      _gradedZ = new Float32Array(hf.z.length);
+    }
+    _gradedZ.set(_padGradedZ && _activeTerrainMods.length > 0 ? _padGradedZ : hf.z);
+
+    for (const c of _activeCircCutouts) {
+      const bb = c.bbox;
+      if (!bb) continue;
+      const ix0 = Math.max(0, Math.floor((bb.minX - hf.minX) / hf.cellSize) - 1);
+      const ix1 = Math.min(hf.nx - 1, Math.ceil((bb.maxX - hf.minX) / hf.cellSize) + 1);
+      const iy0 = Math.max(0, Math.floor((bb.minY - hf.minY) / hf.cellSize) - 1);
+      const iy1 = Math.min(hf.ny - 1, Math.ceil((bb.maxY - hf.minY) / hf.cellSize) + 1);
+      for (let iy = iy0; iy <= iy1; iy++) {
+        const wy = hf.minY + iy * hf.cellSize;
+        const row = iy * hf.nx;
+        for (let ix = ix0; ix <= ix1; ix++) {
+          const wx = hf.minX + ix * hf.cellSize;
+          const dx = wx - c.x;
+          const dy = wy - c.y;
+          const u = dx * c.cos + dy * c.sin;
+          const v = -dx * c.sin + dy * c.cos;
+          if (Math.abs(u) <= c.halfL && Math.abs(v) <= c.halfW) {
+            const sz = c.soffitZAtU(u);
+            if (Number.isFinite(sz) && sz < _gradedZ[row + ix]) {
+              _gradedZ[row + ix] = sz;
+            }
+          }
+        }
+      }
+    }
   }
 
   function setTerrainMods(mods) {
@@ -123,18 +186,20 @@
 
     const site = getSite();
     if (!site || !site.heightfield) {
+      _padGradedZ = null;
       _gradedZ = null;
       return;
     }
     const hf = site.heightfield;
     if (_activeTerrainMods.length === 0) {
-      _gradedZ = null;
+      _padGradedZ = null;
+      _applyCutoutsToGradedZ();
       return;
     }
-    if (!_gradedZ || _gradedZ.length !== hf.z.length) {
-      _gradedZ = new Float32Array(hf.z.length);
+    if (!_padGradedZ || _padGradedZ.length !== hf.z.length) {
+      _padGradedZ = new Float32Array(hf.z.length);
     }
-    _gradedZ.set(hf.z);
+    _padGradedZ.set(hf.z);
 
     for (const mod of _activeTerrainMods) {
       if (!mod || !mod.pts || mod.pts.length < 3) continue;
@@ -148,28 +213,48 @@
         const row = iy * hf.nx;
         for (let ix = ix0; ix <= ix1; ix++) {
           const wx = hf.minX + ix * hf.cellSize;
-          const curZ = _gradedZ[row + ix];
+          const curZ = _padGradedZ[row + ix];
           const targetVal = mod.mode === 'offset' ? (curZ + (Number(mod.deltaZ) || 0)) : Number(mod.targetZ);
           if (!Number.isFinite(targetVal)) continue;
           if (pointInPolygon(wx, wy, mod.pts)) {
-            _gradedZ[row + ix] = targetVal;
+            _padGradedZ[row + ix] = targetVal;
           } else {
             const batter = Math.max(0, Number(mod.batterSlope) || 0);
             if (batter > 0.05) {
               const d = distPointToPolygonEdge(wx, wy, mod.pts);
               if (d < batter) {
                 const t = d / batter;
-                _gradedZ[row + ix] = targetVal * (1 - t) + curZ * t;
+                _padGradedZ[row + ix] = targetVal * (1 - t) + curZ * t;
               }
             }
           }
         }
       }
     }
+    _applyCutoutsToGradedZ();
+  }
+
+  function setCircCutouts(cutouts) {
+    _activeCircCutouts = Array.isArray(cutouts) ? cutouts : [];
+    _terrainVersion++;
+    for (const k of Object.keys(_contourCache)) {
+      delete _contourCache[k];
+    }
+    _applyCutoutsToGradedZ();
   }
 
   function getTerrainVersion() {
     return _terrainVersion;
+  }
+
+  function getPadHeightfieldZ() {
+    const site = getSite();
+    if (_padGradedZ && _activeTerrainMods.length > 0) return _padGradedZ;
+    return site && site.heightfield ? site.heightfield.z : null;
+  }
+
+  function getActiveCircCutouts() {
+    return _activeCircCutouts;
   }
 
   function getGradedHeightfieldZ() {
@@ -890,9 +975,13 @@
 
   window.GROUNDWORK_ENGINE = {
     getGroundZ,
+    getPadGroundZ,
     getOriginalGroundZ,
     setTerrainMods,
+    setCircCutouts,
     getTerrainVersion,
+    getPadHeightfieldZ,
+    getActiveCircCutouts,
     getGradedHeightfieldZ,
     getEffectiveDims,
     getRoofSpec,

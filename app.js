@@ -780,7 +780,7 @@
   let _rainCacheVal = null;
   function getRainwaterAnalysis() {
     const volSig = state.volumes.map(v => `${v.id}:${v.x.toFixed(1)},${v.y.toFixed(1)},${v.w.toFixed(1)},${v.d.toFixed(1)}`).join('|');
-    const circSig = state.circulations.map(c => `${c.id}:${c.x.toFixed(1)},${c.y.toFixed(1)},${c.length.toFixed(1)},${c.width.toFixed(1)}`).join('|');
+    const circSig = state.circulations.map(c => `${c.id}:${c.x.toFixed(1)},${c.y.toFixed(1)},${c.length.toFixed(1)},${c.width.toFixed(1)},${(c.startLift || 0).toFixed(2)},${(c.endLift || 0).toFixed(2)},${c.cutSoil !== false}`).join('|');
     const cfg = state.rainConfig || {};
     const key = `${eng.getTerrainVersion()}|${state.useGross}|${cfg.intensityMmHr}|${cfg.durationHr}|${cfg.annualMm}|${volSig}|${circSig}`;
     if (_rainCacheVal && _rainCacheKey === key) return _rainCacheVal;
@@ -1016,6 +1016,36 @@
 
   function refreshAll(opts = {}) {
     eng.setTerrainMods(state.terrainMods || []);
+    const cutouts = [];
+    for (const c of (state.circulations || [])) {
+      if (c.cutSoil === false) continue;
+      const prof = siteTools.computeCirculationProfile(c, state.volumes, state.useGross);
+      const corners = siteTools.getCirculationCorners(c);
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (const pt of corners) {
+        if (pt.x < minX) minX = pt.x;
+        if (pt.x > maxX) maxX = pt.x;
+        if (pt.y < minY) minY = pt.y;
+        if (pt.y > maxY) maxY = pt.y;
+      }
+      cutouts.push({
+        id: c.id,
+        x: c.x,
+        y: c.y,
+        length: c.length,
+        width: c.width,
+        halfL: c.length * 0.5,
+        halfW: c.width * 0.5,
+        rot: c.rot || 0,
+        cos: Math.cos(c.rot || 0),
+        sin: Math.sin(c.rot || 0),
+        bbox: { minX: minX - 0.1, maxX: maxX + 0.1, minY: minY - 0.1, maxY: maxY + 0.1 },
+        soffitZAtU: prof.soffitZAtU,
+        surfaceZAtU: prof.surfaceZAtU,
+        slabThickness: c.slabThickness || 0.25
+      });
+    }
+    eng.setCircCutouts(cutouts);
     persistAuto();
     updateTopBarMetrics();
     renderProgramDock();
@@ -1445,6 +1475,18 @@
           <input type="text" id="inPadName" value="${escapeHtml(mod.name || 'Terrain Pad')}" />
         </div>
         <div class="field">
+          <label>Rotation (°)</label>
+          <div class="row-between" style="gap:4px;">
+            <input type="number" id="inPadRot" step="1" min="-180" max="180" value="${Math.round(mod.rotDeg || 0)}" style="flex:1;" />
+            <button type="button" class="btn align-btn" data-padrot="-45">-45°</button>
+            <button type="button" class="btn align-btn" data-padrot="-15">-15°</button>
+            <button type="button" class="btn align-btn" data-padrot="reset">0°</button>
+            <button type="button" class="btn align-btn" data-padrot="15">+15°</button>
+            <button type="button" class="btn align-btn" data-padrot="45">+45°</button>
+          </div>
+          <div style="font-size:10px;color:var(--ink-muted);margin-top:3px;">Drag corners to reshape · Drag edges to stretch · Double-click edge to add vertex · Drag knob to rotate</div>
+        </div>
+        <div class="field">
           <label>Grading Operation</label>
           <div class="segmented" style="display:flex;">
             <button type="button" class="seg-btn ${!isOff ? 'active' : ''}" data-padmode="flatten" style="flex:1;">Flatten Level</button>
@@ -1498,6 +1540,29 @@
 
     document.getElementById('inPadName').addEventListener('change', (e) => {
       updateTerrainMod(mod.id, { name: e.target.value }, { forceSidebar: true });
+    });
+    const rotatePadToDeg = (targetDeg) => {
+      let norm = Number(targetDeg) || 0;
+      while (norm > 180) norm -= 360;
+      while (norm < -180) norm += 360;
+      const dRad = (norm - (mod.rotDeg || 0)) * Math.PI / 180;
+      const c = Math.cos(dRad), s = Math.sin(dRad);
+      const statsNow = siteTools.getPolygonStats(mod.pts);
+      const rotatedPts = mod.pts.map(p => ({
+        x: statsNow.cx + (p.x - statsNow.cx) * c - (p.y - statsNow.cy) * s,
+        y: statsNow.cy + (p.x - statsNow.cx) * s + (p.y - statsNow.cy) * c
+      }));
+      updateTerrainMod(mod.id, { pts: rotatedPts, rotDeg: Math.round(norm * 100) / 100 }, { forceSidebar: true });
+    };
+    document.getElementById('inPadRot').addEventListener('change', (e) => {
+      rotatePadToDeg(parseFloat(e.target.value) || 0);
+    });
+    body.querySelectorAll('[data-padrot]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const val = btn.dataset.padrot;
+        if (val === 'reset') rotatePadToDeg(0);
+        else rotatePadToDeg((mod.rotDeg || 0) + parseFloat(val));
+      });
     });
     body.querySelectorAll('[data-padmode]').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -1626,10 +1691,35 @@
           <span class="kw-check-left"><input type="checkbox" id="chkCircAutoZ" ${circ.autoTerrainZ ? 'checked' : ''} /><span>Auto Z from Graded Slope &amp; Bubbles</span></span>
         </label>
         <div class="field-grid">
-          <div class="field"><label>Start Z (m MSL)</label><input type="number" id="inCircZ0" step="0.1" value="${prof.zStart.toFixed(2)}" ${circ.autoTerrainZ ? 'disabled' : ''} /></div>
-          <div class="field"><label>End Z (m MSL)</label><input type="number" id="inCircZ1" step="0.1" value="${prof.zEnd.toFixed(2)}" ${circ.autoTerrainZ ? 'disabled' : ''} /></div>
+          <div class="field">
+            <label>Start Lift ΔZ (m)</label>
+            <input type="number" id="inCircLift0" step="0.1" value="${prof.effectiveStartLift.toFixed(2)}" />
+            <div class="row-between" style="gap:2px;margin-top:3px;">
+              <button type="button" class="btn align-btn" data-lift0="-0.5">-0.5</button>
+              <button type="button" class="btn align-btn" data-lift0="0">0</button>
+              <button type="button" class="btn align-btn" data-lift0="0.5">+0.5</button>
+              <button type="button" class="btn align-btn" data-lift0="1">+1.0</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>End Lift ΔZ (m)</label>
+            <input type="number" id="inCircLift1" step="0.1" value="${prof.effectiveEndLift.toFixed(2)}" />
+            <div class="row-between" style="gap:2px;margin-top:3px;">
+              <button type="button" class="btn align-btn" data-lift1="-0.5">-0.5</button>
+              <button type="button" class="btn align-btn" data-lift1="0">0</button>
+              <button type="button" class="btn align-btn" data-lift1="0.5">+0.5</button>
+              <button type="button" class="btn align-btn" data-lift1="1">+1.0</button>
+            </div>
+          </div>
+        </div>
+        <div class="field-grid">
+          <div class="field"><label>Start Z (m MSL)</label><input type="number" id="inCircZ0" step="0.1" value="${prof.zStart.toFixed(2)}" /></div>
+          <div class="field"><label>End Z (m MSL)</label><input type="number" id="inCircZ1" step="0.1" value="${prof.zEnd.toFixed(2)}" /></div>
         </div>
         ${paramHtml}
+        <label class="kw-check-row">
+          <span class="kw-check-left"><input type="checkbox" id="chkCircCutSoil" ${circ.cutSoil !== false ? 'checked' : ''} /><span>Cut Soil Inside (Excavate Terrain Trench)</span></span>
+        </label>
         <div class="row-between">
           <label class="kw-check-row" style="flex:1;"><span class="kw-check-left"><input type="checkbox" id="chkCircRail" ${circ.railing !== false ? 'checked' : ''} /><span>Handrails</span></span></label>
           <label class="kw-check-row" style="flex:1;"><span class="kw-check-left"><input type="checkbox" id="chkCircWalls" ${circ.sideWalls !== false ? 'checked' : ''} /><span>Side Cheek Walls</span></span></label>
@@ -1656,10 +1746,51 @@
     document.getElementById('inCircWid').addEventListener('change', (e) => updateCirculation(circ.id, { width: Math.max(0.9, parseFloat(e.target.value) || circ.width) }, { forceSidebar: true }));
     document.getElementById('inCircRot').addEventListener('change', (e) => updateCirculation(circ.id, { rot: (parseFloat(e.target.value) || 0) * Math.PI / 180 }, { forceSidebar: true }));
     document.getElementById('chkCircAutoZ').addEventListener('change', (e) => {
-      updateCirculation(circ.id, { autoTerrainZ: e.target.checked, zStart: prof.zStart, zEnd: prof.zEnd }, { forceSidebar: true });
+      if (e.target.checked) {
+        updateCirculation(circ.id, {
+          autoTerrainZ: true,
+          startLift: Math.round((prof.zStart - prof.baseStartZ) * 100) / 100,
+          endLift: Math.round((prof.zEnd - prof.baseEndZ) * 100) / 100
+        }, { forceSidebar: true });
+      } else {
+        updateCirculation(circ.id, { autoTerrainZ: false, zStart: prof.zStart, zEnd: prof.zEnd }, { forceSidebar: true });
+      }
     });
-    document.getElementById('inCircZ0').addEventListener('change', (e) => updateCirculation(circ.id, { zStart: parseFloat(e.target.value) || prof.zStart }, { forceSidebar: true }));
-    document.getElementById('inCircZ1').addEventListener('change', (e) => updateCirculation(circ.id, { zEnd: parseFloat(e.target.value) || prof.zEnd }, { forceSidebar: true }));
+    const applyLift0 = (val) => {
+      const lift = Math.round(val * 100) / 100;
+      const patch = circ.autoTerrainZ
+        ? { startLift: lift }
+        : { startLift: lift, zStart: Math.round((prof.baseStartZ + lift) * 100) / 100 };
+      updateCirculation(circ.id, patch, { forceSidebar: true });
+    };
+    const applyLift1 = (val) => {
+      const lift = Math.round(val * 100) / 100;
+      const patch = circ.autoTerrainZ
+        ? { endLift: lift }
+        : { endLift: lift, zEnd: Math.round((prof.baseEndZ + lift) * 100) / 100 };
+      updateCirculation(circ.id, patch, { forceSidebar: true });
+    };
+    document.getElementById('inCircLift0').addEventListener('change', (e) => applyLift0(parseFloat(e.target.value) || 0));
+    document.getElementById('inCircLift1').addEventListener('change', (e) => applyLift1(parseFloat(e.target.value) || 0));
+    body.querySelectorAll('[data-lift0]').forEach(btn => {
+      btn.addEventListener('click', () => applyLift0(parseFloat(btn.dataset.lift0)));
+    });
+    body.querySelectorAll('[data-lift1]').forEach(btn => {
+      btn.addEventListener('click', () => applyLift1(parseFloat(btn.dataset.lift1)));
+    });
+    document.getElementById('inCircZ0').addEventListener('change', (e) => {
+      const val = parseFloat(e.target.value);
+      if (!Number.isFinite(val)) return;
+      const lift = Math.round((val - prof.baseStartZ) * 100) / 100;
+      updateCirculation(circ.id, circ.autoTerrainZ ? { startLift: lift } : { zStart: val, startLift: lift }, { forceSidebar: true });
+    });
+    document.getElementById('inCircZ1').addEventListener('change', (e) => {
+      const val = parseFloat(e.target.value);
+      if (!Number.isFinite(val)) return;
+      const lift = Math.round((val - prof.baseEndZ) * 100) / 100;
+      updateCirculation(circ.id, circ.autoTerrainZ ? { endLift: lift } : { zEnd: val, endLift: lift }, { forceSidebar: true });
+    });
+    document.getElementById('chkCircCutSoil').addEventListener('change', (e) => updateCirculation(circ.id, { cutSoil: e.target.checked }, { forceSidebar: true }));
 
     if (isStair) {
       document.getElementById('inCircRiser').addEventListener('change', (e) => updateCirculation(circ.id, { riserHeight: parseFloat(e.target.value) || 0.165 }, { forceSidebar: true }));
@@ -1677,7 +1808,13 @@
     document.getElementById('chkCircRail').addEventListener('change', (e) => updateCirculation(circ.id, { railing: e.target.checked }, { forceSidebar: true }));
     document.getElementById('chkCircWalls').addEventListener('change', (e) => updateCirculation(circ.id, { sideWalls: e.target.checked }, { forceSidebar: true }));
     document.getElementById('btnCircFlip').addEventListener('click', () => {
-      updateCirculation(circ.id, { rot: (circ.rot || 0) + Math.PI, zStart: prof.zEnd, zEnd: prof.zStart }, { forceSidebar: true });
+      updateCirculation(circ.id, {
+        rot: (circ.rot || 0) + Math.PI,
+        startLift: circ.endLift || 0,
+        endLift: circ.startLift || 0,
+        zStart: prof.zEnd,
+        zEnd: prof.zStart
+      }, { forceSidebar: true });
     });
     document.getElementById('btnCircDel').addEventListener('click', () => deleteCirculation(circ.id));
   }

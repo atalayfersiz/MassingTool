@@ -101,6 +101,33 @@
           this._commitPolyTerrainMod();
           return;
         }
+        if (state.selectedItem && state.selectedItem.kind === 'terrain') {
+          const mod = (state.terrainMods || []).find(m => m.id === state.selectedItem.id);
+          if (mod && mod.pts && mod.pts.length >= 3) {
+            const vHit = this._hitTestTerrainModVertex(pos.x, pos.y);
+            if (vHit && mod.pts.length > 3) {
+              this.api.pushUndo();
+              const nextPts = mod.pts.filter((_, idx) => idx !== vHit.idx);
+              this.api.updateTerrainMod(mod.id, { shape: 'poly', pts: nextPts }, { silentUndo: true, forceSidebar: true });
+              return;
+            }
+            const hHit = this._hitTestTerrainModHandles(pos.x, pos.y);
+            if (hHit && hHit.kind === 'edge') {
+              const a = mod.pts[hHit.aIdx];
+              const b = mod.pts[hHit.bIdx];
+              const w = this.screenToWorld(pos.x, pos.y);
+              const dx = b.x - a.x, dy = b.y - a.y;
+              const len2 = dx * dx + dy * dy;
+              const t = len2 > 1e-6 ? Math.max(0.1, Math.min(0.9, ((w.x - a.x) * dx + (w.y - a.y) * dy) / len2)) : 0.5;
+              const insPt = { x: a.x + dx * t, y: a.y + dy * t };
+              this.api.pushUndo();
+              const nextPts = mod.pts.map(p => ({ x: p.x, y: p.y }));
+              nextPts.splice(hHit.aIdx + 1, 0, insPt);
+              this.api.updateTerrainMod(mod.id, { shape: 'poly', pts: nextPts }, { silentUndo: true, forceSidebar: true });
+              return;
+            }
+          }
+        }
         if (!state.layers.annotations) return;
         const annHit = this._hitTestAnnotations(pos.x, pos.y);
         if (annHit && annHit.kind === 'text') {
@@ -194,7 +221,10 @@
 
         // Terrain Grading Pad tool (Rectangular or Polygonal)
         if (state.tool === 'terrain') {
-          const snappedPt = (state.layers.snap !== false && !e.altKey) ? this._snapPointToSiteEdges(world, state) : world;
+          const snapRes = (state.layers.snap !== false && !e.altKey)
+            ? this._snapPointToSiteEdges(world, state, { orthoRefs: this.polyDraft.slice(-1) })
+            : { x: world.x, y: world.y, guides: [] };
+          this.snapGuides = snapRes.guides || [];
           if (state.terrainDrawShape === 'poly') {
             if (this.polyDraft.length >= 3) {
               const p0 = this.worldToScreen(this.polyDraft[0].x, this.polyDraft[0].y);
@@ -203,14 +233,14 @@
                 return;
               }
             }
-            this.polyDraft.push({ x: snappedPt.x, y: snappedPt.y });
+            this.polyDraft.push({ x: snapRes.x, y: snapRes.y });
             this.render();
             return;
           } else {
             this.dragState = {
               type: 'tmod-draw-rect',
-              startWorld: { x: snappedPt.x, y: snappedPt.y },
-              currWorld: { x: snappedPt.x, y: snappedPt.y }
+              startWorld: { x: snapRes.x, y: snapRes.y },
+              currWorld: { x: snapRes.x, y: snapRes.y }
             };
             this.canvas.setPointerCapture(e.pointerId);
             this.render();
@@ -220,7 +250,10 @@
 
         // Parametric Ramp / Stair border drawing tool
         if (state.tool === 'ramp' || state.tool === 'stair') {
-          const p1 = (state.layers.snap !== false && !e.altKey) ? this._snapPointToSiteEdges(world, state) : { x: world.x, y: world.y };
+          const snapRes = (state.layers.snap !== false && !e.altKey)
+            ? this._snapPointToSiteEdges(world, state)
+            : { x: world.x, y: world.y, guides: [] };
+          const p1 = { x: snapRes.x, y: snapRes.y };
           this.dragState = {
             type: 'circ-draw',
             kind: state.tool,
@@ -292,16 +325,47 @@
           }
         }
 
-        // 4. Resize/rotate handles on currently selected space / circulation / terrain pad vertex
+        // 4. Resize/rotate handles on currently selected space / circulation / terrain pad vertex, polyline edge & rotate
         if (state.selectedItem && state.selectedItem.kind === 'terrain') {
-          const vHit = this._hitTestTerrainModVertex(pos.x, pos.y);
-          if (vHit) {
+          const tHit = this._hitTestTerrainModHandles(pos.x, pos.y);
+          if (tHit) {
+            const mod = tHit.mod;
+            const obb = window.GROUNDWORK_SITE_TOOLS.getTerrainModOBB(mod);
             this.api.pushUndo();
-            this.dragState = {
-              type: 'tmod-vertex',
-              modId: vHit.mod.id,
-              idx: vHit.idx
-            };
+            if (tHit.kind === 'rotate') {
+              this.dragState = {
+                type: 'tmod-rotate',
+                modId: mod.id,
+                origPts: mod.pts.map(p => ({ x: p.x, y: p.y })),
+                origCenter: { x: obb.cx, y: obb.cy },
+                origW: obb.w,
+                origD: obb.d,
+                origRotRad: ((mod.rotDeg || 0) * Math.PI) / 180,
+                startPtrAng: Math.atan2(world.y - obb.cy, world.x - obb.cx)
+              };
+            } else if (tHit.kind === 'vertex') {
+              this.dragState = {
+                type: 'tmod-vertex',
+                modId: mod.id,
+                idx: tHit.idx
+              };
+            } else if (tHit.kind === 'edge') {
+              const pA = mod.pts[tHit.aIdx];
+              const pB = mod.pts[tHit.bIdx];
+              this.dragState = {
+                type: 'tmod-edge-stretch',
+                modId: mod.id,
+                origPts: mod.pts.map(p => ({ x: p.x, y: p.y })),
+                shape: mod.shape,
+                aIdx: tHit.aIdx,
+                bIdx: tHit.bIdx,
+                nx: tHit.nx,
+                ny: tHit.ny,
+                edgeMid: { x: (pA.x + pB.x) * 0.5, y: (pA.y + pB.y) * 0.5 },
+                startWorld: world,
+                altStart: !!e.altKey
+              };
+            }
             this.canvas.setPointerCapture(e.pointerId);
             return;
           }
@@ -463,7 +527,8 @@
             type: 'tmod-move',
             modId: hitMod.id,
             startWorld: world,
-            origPts: hitMod.pts.map(p => ({ x: p.x, y: p.y }))
+            origPts: hitMod.pts.map(p => ({ x: p.x, y: p.y })),
+            origOBB: window.GROUNDWORK_SITE_TOOLS.getTerrainModOBB(hitMod)
           };
           this.canvas.setPointerCapture(e.pointerId);
           this.render();
@@ -733,8 +798,11 @@
         }
 
         if (this.dragState.type === 'tmod-draw-rect') {
-          const snappedPt = (state.layers.snap !== false && !e.altKey) ? this._snapPointToSiteEdges(world, state) : world;
-          this.dragState.currWorld = { x: snappedPt.x, y: snappedPt.y };
+          const snapRes = (state.layers.snap !== false && !e.altKey)
+            ? this._snapPointToSiteEdges(world, state, { orthoRefs: [this.dragState.startWorld] })
+            : { x: world.x, y: world.y, guides: [] };
+          this.dragState.currWorld = { x: snapRes.x, y: snapRes.y };
+          this.snapGuides = snapRes.guides || [];
           this.render();
           return;
         }
@@ -742,7 +810,11 @@
         if (this.dragState.type === 'circ-draw') {
           let p2 = this._snapAnglePoint(this.dragState.p1, world, e.shiftKey);
           if (!e.shiftKey && state.layers.snap !== false && !e.altKey) {
-            p2 = this._snapPointToSiteEdges(p2, state);
+            const snapRes = this._snapPointToSiteEdges(p2, state, { orthoRefs: [this.dragState.p1] });
+            p2 = { x: snapRes.x, y: snapRes.y };
+            this.snapGuides = snapRes.guides || [];
+          } else {
+            this.snapGuides = [];
           }
           this.dragState.p2 = p2;
           this.render();
@@ -752,15 +824,85 @@
         if (this.dragState.type === 'tmod-vertex') {
           const mod = (state.terrainMods || []).find(m => m.id === this.dragState.modId);
           if (!mod) return;
-          const snappedPt = (state.layers.snap !== false && !e.altKey) ? this._snapPointToSiteEdges(world, state) : world;
-          const pts = mod.pts.map((p, i) => i === this.dragState.idx ? { x: snappedPt.x, y: snappedPt.y } : { x: p.x, y: p.y });
-          this.api.updateTerrainMod(mod.id, { pts }, { silentUndo: true });
+          const n = mod.pts.length;
+          const orthoRefs = [mod.pts[(this.dragState.idx - 1 + n) % n], mod.pts[(this.dragState.idx + 1) % n]];
+          const snapRes = (state.layers.snap !== false && !e.altKey)
+            ? this._snapPointToSiteEdges(world, state, { excludeModId: mod.id, orthoRefs })
+            : { x: world.x, y: world.y, guides: [] };
+          this.snapGuides = snapRes.guides || [];
+          const pts = mod.pts.map((p, i) => i === this.dragState.idx ? { x: snapRes.x, y: snapRes.y } : { x: p.x, y: p.y });
+          this.api.updateTerrainMod(mod.id, { shape: 'poly', pts }, { silentUndo: true });
+          return;
+        }
+
+        if (this.dragState.type === 'tmod-rotate') {
+          const d = this.dragState;
+          const curAng = Math.atan2(world.y - d.origCenter.y, world.x - d.origCenter.x);
+          const deltaPtr = Math.atan2(Math.sin(curAng - d.startPtrAng), Math.cos(curAng - d.startPtrAng));
+          let targetRot = d.origRotRad + deltaPtr;
+          if (e.shiftKey) {
+            const step = Math.PI / 12;
+            targetRot = Math.round(targetRot / step) * step;
+            this.snapGuides = [];
+          } else if (state.layers.snap !== false && !e.altKey) {
+            const rs = this._computeRotateSnap({ id: d.modId, x: d.origCenter.x, y: d.origCenter.y, w: d.origW, d: d.origD }, targetRot, state);
+            targetRot = rs.ang;
+            this.snapGuides = rs.guides || [];
+          } else {
+            this.snapGuides = [];
+          }
+          const applyDelta = targetRot - d.origRotRad;
+          const c = Math.cos(applyDelta), s = Math.sin(applyDelta);
+          const pts = d.origPts.map(p => ({
+            x: d.origCenter.x + (p.x - d.origCenter.x) * c - (p.y - d.origCenter.y) * s,
+            y: d.origCenter.y + (p.x - d.origCenter.x) * s + (p.y - d.origCenter.y) * c
+          }));
+          let deg = (targetRot * 180) / Math.PI;
+          while (deg > 180) deg -= 360;
+          while (deg < -180) deg += 360;
+          this.api.updateTerrainMod(d.modId, { pts, rotDeg: Math.round(deg * 100) / 100 }, { silentUndo: true });
+          return;
+        }
+
+        if (this.dragState.type === 'tmod-edge-stretch') {
+          const d = this.dragState;
+          let shiftN = (world.x - d.startWorld.x) * d.nx + (world.y - d.startWorld.y) * d.ny;
+          const symmetric = !!(e.altKey || d.altStart) && d.origPts.length === 4;
+          if (state.layers.snap !== false && !e.altKey) {
+            const es = this._computePadEdgeStretchSnap(d, shiftN, state);
+            shiftN = es.shiftN;
+            this.snapGuides = es.guides || [];
+          } else {
+            this.snapGuides = [];
+          }
+          const oppA = (d.aIdx + 2) % 4;
+          const oppB = (d.bIdx + 2) % 4;
+          const nextPts = d.origPts.map((p, i) => {
+            if (i === d.aIdx || i === d.bIdx) {
+              return { x: p.x + shiftN * d.nx, y: p.y + shiftN * d.ny };
+            }
+            if (symmetric && (i === oppA || i === oppB)) {
+              return { x: p.x - shiftN * d.nx, y: p.y - shiftN * d.ny };
+            }
+            return { x: p.x, y: p.y };
+          });
+          if (window.GROUNDWORK_SITE_TOOLS.getPolygonStats(nextPts).padArea >= 0.5) {
+            this.api.updateTerrainMod(d.modId, { pts: nextPts }, { silentUndo: true });
+          }
           return;
         }
 
         if (this.dragState.type === 'tmod-move') {
-          const dx = world.x - this.dragState.startWorld.x;
-          const dy = world.y - this.dragState.startWorld.y;
+          let dx = world.x - this.dragState.startWorld.x;
+          let dy = world.y - this.dragState.startWorld.y;
+          if (state.layers.snap !== false && !e.altKey) {
+            const snap = this._computePadMoveSnap(this.dragState.origPts, this.dragState.origOBB, this.dragState.modId, dx, dy, state);
+            dx = snap.dx;
+            dy = snap.dy;
+            this.snapGuides = snap.guides || [];
+          } else {
+            this.snapGuides = [];
+          }
           const pts = this.dragState.origPts.map(p => ({ x: p.x + dx, y: p.y + dy }));
           this.api.updateTerrainMod(this.dragState.modId, { pts }, { silentUndo: true });
           return;
@@ -1031,6 +1173,14 @@
         this.canvas.style.cursor = 'move';
         return;
       }
+      if (state.selectedItem && state.selectedItem.kind === 'terrain' && this._hitTestTerrainModHandles(sx, sy)) {
+        this.canvas.style.cursor = 'pointer';
+        return;
+      }
+      if (state.selectedItem && state.selectedItem.kind === 'circulation' && this._hitTestCircHandles(sx, sy)) {
+        this.canvas.style.cursor = 'pointer';
+        return;
+      }
       if (this._hitTestHandles(sx, sy)) { this.canvas.style.cursor = 'pointer'; return; }
       if (this._hitTestDimTextBox(sx, sy) || this._hitTestSectionTextBoxes(sx, sy)) {
         this.canvas.style.cursor = 'pointer';
@@ -1040,7 +1190,12 @@
         this.canvas.style.cursor = 'move';
         return;
       }
-      this.canvas.style.cursor = hitVol ? 'move' : 'default';
+      const wPos = this.screenToWorld(sx, sy);
+      if (hitVol || this._hitTestCirculationBody(wPos.x, wPos.y) || this._hitTestTerrainModBody(wPos.x, wPos.y)) {
+        this.canvas.style.cursor = 'move';
+        return;
+      }
+      this.canvas.style.cursor = 'default';
     }
 
     _isSectionActive(state) {
@@ -1244,6 +1399,8 @@
         dimStroke: '#ece8df',
         dimBg: 'rgba(33, 32, 29, 0.94)',
         dimBorder: '#504b42',
+        badgeBg: 'rgba(33, 32, 29, 0.94)',
+        badgeBorder: '#504b42',
         marqueeFill: 'rgba(236, 232, 223, 0.07)',
         marqueeStroke: 'rgba(236, 232, 223, 0.55)',
         northBg: 'rgba(33, 32, 29, 0.88)',
@@ -1288,6 +1445,8 @@
         dimStroke: '#22201d',
         dimBg: 'rgba(252, 251, 248, 0.94)',
         dimBorder: '#bdb5a5',
+        badgeBg: 'rgba(252, 251, 248, 0.94)',
+        badgeBorder: '#bdb5a5',
         marqueeFill: 'rgba(36, 34, 31, 0.06)',
         marqueeStroke: 'rgba(36, 34, 31, 0.55)',
         northBg: 'rgba(252, 251, 248, 0.85)',
@@ -2450,16 +2609,17 @@
         }
       }
       for (const m of (state.terrainMods || [])) {
+        if (dragIds.has(m.id)) continue;
         if (m.pts && m.pts.length >= 3) {
-          const st = window.GROUNDWORK_SITE_TOOLS.getPolygonStats(m.pts);
+          const obb = window.GROUNDWORK_SITE_TOOLS.getTerrainModOBB(m);
           targets.push({
             id: m.id,
             ref: m.name,
-            x: (st.minX + st.maxX) * 0.5,
-            y: (st.minY + st.maxY) * 0.5,
-            w: Math.max(1, st.maxX - st.minX),
-            d: Math.max(1, st.maxY - st.minY),
-            rot: 0
+            x: obb.cx,
+            y: obb.cy,
+            w: obb.w,
+            d: obb.d,
+            rot: obb.rot
           });
         }
       }
@@ -2647,6 +2807,20 @@
           cands.push({ ang: bRot + k * Math.PI * 0.5, label: `∠ ${B.ref || B.id}` });
         }
       }
+      for (const C of (state.circulations || [])) {
+        if (C.id === vol.id) continue;
+        const cRot = C.rot || 0;
+        for (let k = -2; k <= 2; k++) {
+          cands.push({ ang: cRot + k * Math.PI * 0.5, label: `∠ ${C.name || 'Circ'}` });
+        }
+      }
+      for (const M of (state.terrainMods || [])) {
+        if (M.id === vol.id || !M.pts || M.pts.length < 3) continue;
+        const obb = window.GROUNDWORK_SITE_TOOLS.getTerrainModOBB(M);
+        for (let k = -2; k <= 2; k++) {
+          cands.push({ ang: obb.rot + k * Math.PI * 0.5, label: `∠ ${M.name || 'Pad'}` });
+        }
+      }
 
       let best = null;
       for (const cd of cands) {
@@ -2686,10 +2860,26 @@
       let bestU = null;
       let bestV = null;
 
+      const siteTools = window.GROUNDWORK_SITE_TOOLS;
+      const resizeTargets = [];
       for (const B of state.volumes) {
         if (B.id === orig.id) continue;
         if (Math.abs(Math.sin((B.rot || 0) - rot)) > 0.08) continue;
-        const corners = eng.getFootprintCorners(B, state.useGross);
+        resizeTargets.push(eng.getFootprintCorners(B, state.useGross));
+      }
+      for (const m of (state.terrainMods || [])) {
+        if (m.id === orig.id || !m.pts || m.pts.length < 3) continue;
+        const obb = siteTools.getTerrainModOBB(m);
+        if (Math.abs(Math.sin((obb.rot || 0) - rot)) > 0.08 && Math.abs(Math.cos((obb.rot || 0) - rot)) > 0.08) continue;
+        resizeTargets.push(m.pts);
+      }
+      for (const cItem of (state.circulations || [])) {
+        if (cItem.id === orig.id) continue;
+        if (Math.abs(Math.sin((cItem.rot || 0) - rot)) > 0.08) continue;
+        resizeTargets.push(siteTools.getCirculationCorners(cItem));
+      }
+
+      for (const corners of resizeTargets) {
         let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
         for (const pt of corners) {
           const u = (pt.x - orig.x) * c + (pt.y - orig.y) * s;
@@ -2809,18 +2999,20 @@
       this.api.setTool('select');
     }
 
-    _snapPointToSiteEdges(world, state) {
+    _snapPointToSiteEdges(world, state, opts = {}) {
       const eng = window.GROUNDWORK_ENGINE;
       const siteTools = window.GROUNDWORK_SITE_TOOLS;
       const tol = Math.max(0.4, Math.min(1.8, 10 / Math.max(0.5, this.cam.pxPerM)));
       let bestPt = { x: world.x, y: world.y };
       let bestD = tol;
+      let snapKind = null;
+      let refPt = null;
 
       const checkPoly = (pts) => {
         for (let i = 0; i < pts.length; i++) {
           const p = pts[i];
           const dV = Math.hypot(world.x - p.x, world.y - p.y);
-          if (dV < bestD) { bestD = dV; bestPt = { x: p.x, y: p.y }; }
+          if (dV < bestD) { bestD = dV; bestPt = { x: p.x, y: p.y }; snapKind = 'Vertex'; refPt = p; }
           const q = pts[(i + 1) % pts.length];
           const vx = q.x - p.x, vy = q.y - p.y;
           const len2 = vx * vx + vy * vy;
@@ -2828,15 +3020,187 @@
             const t = Math.max(0, Math.min(1, ((world.x - p.x) * vx + (world.y - p.y) * vy) / len2));
             const px = p.x + t * vx, py = p.y + t * vy;
             const dE = Math.hypot(world.x - px, world.y - py);
-            if (dE < bestD) { bestD = dE; bestPt = { x: px, y: py }; }
+            if (dE < bestD) { bestD = dE; bestPt = { x: px, y: py }; snapKind = 'Edge'; refPt = p; }
           }
         }
       };
 
       for (const v of state.volumes) checkPoly(eng.getFootprintCorners(v, state.useGross));
-      for (const m of (state.terrainMods || [])) if (m.pts && m.pts.length >= 3) checkPoly(m.pts);
+      for (const m of (state.terrainMods || [])) {
+        if (m.id === opts.excludeModId || !m.pts || m.pts.length < 3) continue;
+        checkPoly(m.pts);
+      }
       for (const c of (state.circulations || [])) checkPoly(siteTools.getCirculationCorners(c));
-      return bestPt;
+
+      const guides = [];
+      if (snapKind && refPt) {
+        guides.push({ kind: 'line', p1: refPt, p2: bestPt, label: snapKind });
+      }
+      if (!snapKind && Array.isArray(opts.orthoRefs) && opts.orthoRefs.length > 0) {
+        let bestOx = tol * 0.75, bestOy = tol * 0.75;
+        let oxRef = null, oyRef = null;
+        for (const r of opts.orthoRefs) {
+          if (!r) continue;
+          const dx = Math.abs(world.x - r.x);
+          const dy = Math.abs(world.y - r.y);
+          if (dx < bestOx) { bestOx = dx; oxRef = r; }
+          if (dy < bestOy) { bestOy = dy; oyRef = r; }
+        }
+        if (oxRef) {
+          bestPt.x = oxRef.x;
+          guides.push({ kind: 'line', p1: oxRef, p2: { ...bestPt }, label: 'Ortho X' });
+        }
+        if (oyRef) {
+          bestPt.y = oyRef.y;
+          guides.push({ kind: 'line', p1: oyRef, p2: { ...bestPt }, label: 'Ortho Y' });
+        }
+      }
+      return { x: bestPt.x, y: bestPt.y, guides };
+    }
+
+    _computePadMoveSnap(origPts, origOBB, modId, dx, dy, state) {
+      const obbSnap = this._computeMoveSnap(dx, dy, state, {
+        id: modId,
+        x: origOBB.cx,
+        y: origOBB.cy,
+        w: origOBB.w,
+        d: origOBB.d,
+        rot: origOBB.rot || 0
+      });
+      const eng = window.GROUNDWORK_ENGINE;
+      const siteTools = window.GROUNDWORK_SITE_TOOLS;
+      const snapTol = Math.max(0.45, Math.min(2.0, 10 / Math.max(0.5, this.cam.pxPerM)));
+
+      const tgtVerts = [];
+      for (const v of state.volumes) tgtVerts.push(...eng.getFootprintCorners(v, state.useGross));
+      for (const c of (state.circulations || [])) tgtVerts.push(...siteTools.getCirculationCorners(c));
+      for (const m of (state.terrainMods || [])) {
+        if (m.id !== modId && m.pts && m.pts.length >= 3) tgtVerts.push(...m.pts);
+      }
+
+      let bestV = null;
+      for (const p of origPts) {
+        const px = p.x + dx, py = p.y + dy;
+        for (const q of tgtVerts) {
+          const err = Math.hypot(q.x - px, q.y - py);
+          if (err < snapTol && (!bestV || err < bestV.err)) {
+            bestV = { err, dx: dx + (q.x - px), dy: dy + (q.y - py), q };
+          }
+        }
+      }
+      if (bestV && ((!obbSnap.guides || obbSnap.guides.length === 0) || bestV.err < 0.25)) {
+        return {
+          dx: bestV.dx,
+          dy: bestV.dy,
+          guides: [{ kind: 'line', p1: bestV.q, p2: bestV.q, label: 'Corner Snap' }]
+        };
+      }
+      return { dx: obbSnap.dx, dy: obbSnap.dy, guides: obbSnap.guides || [] };
+    }
+
+    _computePadEdgeStretchSnap(d, shiftN, state) {
+      const eng = window.GROUNDWORK_ENGINE;
+      const siteTools = window.GROUNDWORK_SITE_TOOLS;
+      const snapTol = Math.max(0.35, Math.min(1.5, 9 / Math.max(0.5, this.cam.pxPerM)));
+
+      const pts = [];
+      for (const v of state.volumes) pts.push(...eng.getFootprintCorners(v, state.useGross));
+      for (const c of (state.circulations || [])) pts.push(...siteTools.getCirculationCorners(c));
+      for (const m of (state.terrainMods || [])) {
+        if (m.id !== d.modId && m.pts && m.pts.length >= 3) pts.push(...m.pts);
+      }
+
+      let best = null;
+      for (const q of pts) {
+        const proj = (q.x - d.edgeMid.x) * d.nx + (q.y - d.edgeMid.y) * d.ny;
+        const err = Math.abs(proj - shiftN);
+        if (err < snapTol && (!best || err < best.err)) {
+          best = { err, shiftN: proj, q };
+        }
+      }
+      if (!best) return { shiftN, guides: [] };
+      const pEdge = { x: d.edgeMid.x + best.shiftN * d.nx, y: d.edgeMid.y + best.shiftN * d.ny };
+      return {
+        shiftN: best.shiftN,
+        guides: [{ kind: 'line', p1: best.q, p2: pEdge, label: 'Align Edge' }]
+      };
+    }
+
+    _getTerrainModHandles(mod) {
+      if (!mod || !mod.pts || mod.pts.length < 3) return [];
+      const siteTools = window.GROUNDWORK_SITE_TOOLS;
+      const obb = siteTools.getTerrainModOBB(mod);
+      let signed2 = 0;
+      for (let i = 0; i < mod.pts.length; i++) {
+        const a = mod.pts[i], b = mod.pts[(i + 1) % mod.pts.length];
+        signed2 += a.x * b.y - b.x * a.y;
+      }
+      const ccwSign = signed2 >= 0 ? 1 : -1;
+      const handles = [];
+      for (let i = 0; i < mod.pts.length; i++) {
+        const sp = this.worldToScreen(mod.pts[i].x, mod.pts[i].y);
+        handles.push({ kind: 'vertex', idx: i, wx: mod.pts[i].x, wy: mod.pts[i].y, x: sp.x, y: sp.y });
+      }
+      for (let i = 0; i < mod.pts.length; i++) {
+        const a = mod.pts[i];
+        const b = mod.pts[(i + 1) % mod.pts.length];
+        const len = Math.hypot(b.x - a.x, b.y - a.y);
+        if (len < 0.05) continue;
+        const tx = (b.x - a.x) / len;
+        const ty = (b.y - a.y) / len;
+        const nx = ccwSign > 0 ? ty : -ty;
+        const ny = ccwSign > 0 ? -tx : tx;
+        const mx = (a.x + b.x) * 0.5;
+        const my = (a.y + b.y) * 0.5;
+        const sp = this.worldToScreen(mx, my);
+        handles.push({
+          kind: 'edge',
+          idx: i,
+          aIdx: i,
+          bIdx: (i + 1) % mod.pts.length,
+          nx, ny,
+          ang: Math.atan2(b.y - a.y, b.x - a.x),
+          wx: mx, wy: my,
+          x: sp.x, y: sp.y
+        });
+      }
+      const rotOff = Math.max(14 / this.cam.pxPerM, 1.5);
+      const ax = obb.cx - Math.sin(obb.rot) * (obb.d * 0.5);
+      const ay = obb.cy + Math.cos(obb.rot) * (obb.d * 0.5);
+      const rx = obb.cx - Math.sin(obb.rot) * (obb.d * 0.5 + rotOff);
+      const ry = obb.cy + Math.cos(obb.rot) * (obb.d * 0.5 + rotOff);
+      handles.push({
+        kind: 'rotate',
+        ...this.worldToScreen(rx, ry),
+        anchor: this.worldToScreen(ax, ay)
+      });
+      return handles;
+    }
+
+    _hitTestTerrainModHandles(sx, sy) {
+      const state = this.api.getState();
+      if (!state.selectedItem || state.selectedItem.kind !== 'terrain') return null;
+      const mod = (state.terrainMods || []).find(m => m.id === state.selectedItem.id);
+      if (!mod || !mod.pts || mod.pts.length < 3) return null;
+      const hs = this._getTerrainModHandles(mod);
+      const rotH = hs.find(h => h.kind === 'rotate');
+      if (rotH && Math.hypot(sx - rotH.x, sy - rotH.y) <= 10) return { mod, ...rotH };
+      for (const h of hs) {
+        if (h.kind === 'vertex' && Math.hypot(sx - h.x, sy - h.y) <= 9) return { mod, ...h };
+      }
+      for (const h of hs) {
+        if (h.kind === 'edge' && Math.hypot(sx - h.x, sy - h.y) <= 9) return { mod, ...h };
+      }
+      for (const h of hs) {
+        if (h.kind !== 'edge') continue;
+        const spA = this.worldToScreen(mod.pts[h.aIdx].x, mod.pts[h.aIdx].y);
+        const spB = this.worldToScreen(mod.pts[h.bIdx].x, mod.pts[h.bIdx].y);
+        if (Math.hypot(sx - spA.x, sy - spA.y) <= 8 || Math.hypot(sx - spB.x, sy - spB.y) <= 8) continue;
+        if (this._distPointToSegment(sx, sy, spA.x, spA.y, spB.x, spB.y) <= 7) {
+          return { mod, ...h };
+        }
+      }
+      return null;
     }
 
     _hitTestTerrainModVertex(sx, sy) {
@@ -2929,10 +3293,14 @@
         ctx.fill();
 
         if (mod.retainingWalls !== false) {
+          ctx.lineJoin = 'miter';
+          ctx.miterLimit = 10;
           ctx.strokeStyle = isDark ? '#787166' : '#575249';
           ctx.lineWidth = Math.max(2.5, (mod.wallThickness || 0.35) * this.cam.pxPerM);
           ctx.stroke();
         }
+        ctx.lineJoin = 'miter';
+        ctx.miterLimit = 10;
         ctx.strokeStyle = isSel ? pal.ink : (isCutDom ? '#b85d43' : '#9b7729');
         ctx.lineWidth = isSel ? 2.0 : 1.3;
         ctx.setLineDash([5, 3]);
@@ -2957,13 +3325,43 @@
         ctx.fillText(lbl, sc.x, sc.y);
 
         if (isSel) {
-          for (const pt of mod.pts) {
-            const vp = this.worldToScreen(pt.x, pt.y);
-            ctx.fillStyle = pal.handleFill;
+          const hs = this._getTerrainModHandles(mod);
+          const rotH = hs.find(h => h.kind === 'rotate');
+          if (rotH && rotH.anchor) {
             ctx.strokeStyle = pal.ink;
-            ctx.lineWidth = 1.4;
-            ctx.fillRect(vp.x - 4, vp.y - 4, 8, 8);
-            ctx.strokeRect(vp.x - 4, vp.y - 4, 8, 8);
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(rotH.anchor.x, rotH.anchor.y);
+            ctx.lineTo(rotH.x, rotH.y);
+            ctx.stroke();
+            ctx.fillStyle = pal.handleFill;
+            ctx.lineWidth = 1.3;
+            ctx.beginPath();
+            ctx.arc(rotH.x, rotH.y, 4.5, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+          }
+          for (const h of hs) {
+            if (h.kind === 'edge') {
+              ctx.save();
+              ctx.translate(h.x, h.y);
+              ctx.rotate(-h.ang);
+              ctx.fillStyle = pal.handleFill;
+              ctx.strokeStyle = pal.ink;
+              ctx.lineWidth = 1.2;
+              ctx.fillRect(-5, -2.5, 10, 5);
+              ctx.strokeRect(-5, -2.5, 10, 5);
+              ctx.restore();
+            }
+          }
+          for (const h of hs) {
+            if (h.kind === 'vertex') {
+              ctx.fillStyle = pal.handleFill;
+              ctx.strokeStyle = pal.ink;
+              ctx.lineWidth = 1.4;
+              ctx.fillRect(h.x - 4, h.y - 4, 8, 8);
+              ctx.strokeRect(h.x - 4, h.y - 4, 8, 8);
+            }
           }
         }
         ctx.restore();

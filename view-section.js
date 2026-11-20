@@ -312,16 +312,40 @@
           return;
         }
 
+        // 5a. Selected Ramp/Stair Start/End Lift Handles in Section
+        const circLiftHit = this._hitTestCircLiftHandle(pos.x, pos.y);
+        if (circLiftHit) {
+          const prof = circLiftHit.cs.profile;
+          this.api.selectItem('circulation', circLiftHit.cs.circ.id);
+          this.api.pushUndo();
+          this.dragState = {
+            type: 'circ-end-lift',
+            circId: circLiftHit.cs.circ.id,
+            end: circLiftHit.end,
+            startZ: sec.z,
+            origZ: circLiftHit.end === 'start' ? prof.zStart : prof.zEnd,
+            baseZ: circLiftHit.end === 'start' ? prof.baseStartZ : prof.baseEndZ,
+            sPos: circLiftHit.end === 'start' ? circLiftHit.cs.sStart : circLiftHit.cs.sEnd,
+            autoTerrainZ: circLiftHit.cs.circ.autoTerrainZ
+          };
+          this.canvas.setPointerCapture(e.pointerId);
+          this.render();
+          return;
+        }
+
         // 5b. Terrain pad push/pull click & drag in Section
         const padHit = this._hitTestTerrainModSlice(sec);
         if (padHit) {
           this.api.selectItem('terrain', padHit.mod.id);
           this.api.pushUndo();
+          const sp0 = padHit.spans[0];
           this.dragState = {
             type: 'tmod-z',
             modId: padHit.mod.id,
             startZ: sec.z,
             mode: padHit.mod.mode,
+            origPadZ: padHit.padZMid,
+            padMidS: sp0 ? (sp0.sMin + sp0.sMax) * 0.5 : sec.s,
             origTargetZ: padHit.mod.targetZ,
             origDeltaZ: padHit.mod.deltaZ || 0
           };
@@ -382,6 +406,7 @@
           else if (state.tool === 'text') this.canvas.style.cursor = 'text';
           else if (state.tool === 'dimension' || state.tool === 'line') this.canvas.style.cursor = 'crosshair';
           else if (this._hitTestSelectedDimEndpoint(pos.x, pos.y) || this._hitTestSelectedLineEndpoint(pos.x, pos.y) || this._hitTestDimTextBox(pos.x, pos.y)) this.canvas.style.cursor = 'pointer';
+          else if (this._hitTestCircLiftHandle(pos.x, pos.y) || this._hitTestTerrainModSlice(sec)) this.canvas.style.cursor = 'ns-resize';
           else if (state.layers.annotations && this._hitTestAnnotations(pos.x, pos.y)) this.canvas.style.cursor = 'move';
           else if (hit && hit.mode === 'height') this.canvas.style.cursor = 'ns-resize';
           else if (hit) this.canvas.style.cursor = 'move';
@@ -495,11 +520,58 @@
           return;
         }
 
+        if (this.dragState.type === 'circ-end-lift') {
+          const d = this.dragState;
+          let newZ = d.origZ + (sec.z - d.startZ);
+          if (state.layers.snap !== false && !e.altKey) {
+            const zTol = 0.45;
+            let best = null;
+            const tryZ = (tz, s1, s2, label) => {
+              const err = Math.abs(newZ - tz);
+              if (err < zTol && (!best || err < best.err)) {
+                best = { err, z: tz, s1: Math.min(d.sPos, s1) - 3, s2: Math.max(d.sPos, s2) + 3, label };
+              }
+            };
+            tryZ(d.baseZ, d.sPos - 4, d.sPos + 4, 'Grade Z');
+            for (const other of (this.lastSlices || [])) {
+              if (!other || !other.vol) continue;
+              tryZ(other.zBase, other.sMin, other.sMax, `Base Z (${other.vol.ref})`);
+              tryZ(other.zTop, other.sMin, other.sMax, `Top Z (${other.vol.ref})`);
+            }
+            for (const ps of (this.lastPadSlices || [])) {
+              const sp0 = ps.spans[0];
+              tryZ(ps.padZMid, sp0 ? sp0.sMin : d.sPos - 4, sp0 ? sp0.sMax : d.sPos + 4, `Pad Z (${ps.mod.name})`);
+            }
+            if (best) {
+              newZ = Math.round(best.z * 100) / 100;
+              this.snapGuides = [{ s1: best.s1, z1: newZ, s2: best.s2, z2: newZ, label: best.label }];
+            } else {
+              this.snapGuides = [];
+            }
+          } else {
+            this.snapGuides = [];
+          }
+          const lift = Math.round((newZ - d.baseZ) * 100) / 100;
+          const patch = d.end === 'start'
+            ? (d.autoTerrainZ ? { startLift: lift } : { startLift: lift, zStart: Math.round(newZ * 100) / 100 })
+            : (d.autoTerrainZ ? { endLift: lift } : { endLift: lift, zEnd: Math.round(newZ * 100) / 100 });
+          this.api.updateCirculation(d.circId, patch, { silentUndo: true });
+          return;
+        }
+
         if (this.dragState.type === 'tmod-z') {
-          const dz = sec.z - this.dragState.startZ;
+          let rawZ = this.dragState.origPadZ + (sec.z - this.dragState.startZ);
+          if (state.layers.snap !== false && !e.altKey) {
+            const sp = this._computeSecPadSnap(this.dragState.modId, this.dragState.padMidS, rawZ);
+            rawZ = sp.z;
+            this.snapGuides = sp.guides || [];
+          } else {
+            this.snapGuides = [];
+          }
+          const effDz = rawZ - this.dragState.origPadZ;
           const patch = this.dragState.mode === 'offset'
-            ? { deltaZ: Math.round((this.dragState.origDeltaZ + dz) * 100) / 100 }
-            : { targetZ: Math.round((this.dragState.origTargetZ + dz) * 100) / 100 };
+            ? { deltaZ: Math.round((this.dragState.origDeltaZ + effDz) * 100) / 100 }
+            : { targetZ: Math.round((this.dragState.origTargetZ + effDz) * 100) / 100 };
           this.api.updateTerrainMod(this.dragState.modId, patch, { silentUndo: true });
           return;
         }
@@ -1641,6 +1713,62 @@
         }
       }
 
+      // Snap bubbles TO Terrain Pads & Circulations in Section
+      for (const ps of (this.lastPadSlices || [])) {
+        const sp0 = ps.spans[0];
+        if (!sp0) continue;
+        const pz = ps.padZMid;
+        const zPadErr = Math.abs(rawZBase - pz);
+        if (zPadErr < zTol && (!bestZ || zPadErr < bestZ.err)) {
+          bestZ = {
+            err: zPadErr,
+            newDz: pz - os.zBase,
+            lineZ: pz,
+            sMin: Math.min(rawSMin, sp0.sMin) - 3,
+            sMax: Math.max(rawSMax, sp0.sMax) + 3,
+            label: `Pad Z (${ps.mod.name})`
+          };
+        }
+        for (const sp of ps.spans) {
+          const sCands = [
+            { cur: rawSMin, target: sp.sMin, newDs: sp.sMin - os.sMin, label: 'Pad Edge' },
+            { cur: rawSMax, target: sp.sMax, newDs: sp.sMax - os.sMax, label: 'Pad Edge' },
+            { cur: rawSMin, target: sp.sMax, newDs: sp.sMax - os.sMin, label: 'Abut Pad' },
+            { cur: rawSMax, target: sp.sMin, newDs: sp.sMin - os.sMax, label: 'Abut Pad' }
+          ];
+          for (const sc of sCands) {
+            const err = Math.abs(sc.cur - sc.target);
+            if (err < sTol && (!bestS || err < bestS.err)) {
+              bestS = {
+                err,
+                newDs: sc.newDs,
+                lineS: sc.target,
+                zMin: Math.min(rawZBase, pz) - 2,
+                zMax: Math.max(rawZTop, pz) + 2.5,
+                label: sc.label
+              };
+            }
+          }
+        }
+      }
+      for (const cs of (this.lastCircSlices || [])) {
+        const prof = cs.profile;
+        if (!prof) continue;
+        for (const tz of [prof.zStart, prof.zEnd]) {
+          const err = Math.abs(rawZBase - tz);
+          if (err < zTol && (!bestZ || err < bestZ.err)) {
+            bestZ = {
+              err,
+              newDz: tz - os.zBase,
+              lineZ: tz,
+              sMin: Math.min(rawSMin, cs.sMin) - 3,
+              sMax: Math.max(rawSMax, cs.sMax) + 3,
+              label: `Circ Z (${cs.circ.name})`
+            };
+          }
+        }
+      }
+
       const guides = [];
       const outDs = bestS ? bestS.newDs : ds;
       const outDz = bestZ ? bestZ.newDz : dz;
@@ -1684,6 +1812,58 @@
         }
       }
       ctx.restore();
+    }
+
+    _computeSecPadSnap(modId, midS, rawZ) {
+      const zTol = 0.45;
+      const eng = window.GROUNDWORK_ENGINE;
+      const plane = this.api.getActivePlane();
+      let best = null;
+      const tryZ = (tz, s1, s2, label) => {
+        const err = Math.abs(rawZ - tz);
+        if (err < zTol && (!best || err < best.err)) {
+          best = { err, z: tz, s1: Math.min(midS - 3, s1), s2: Math.max(midS + 3, s2), label };
+        }
+      };
+
+      if (plane) {
+        const basis = eng.getPlaneBasis(plane);
+        const wp = eng.planeToWorld(midS, 0, basis);
+        tryZ(eng.getOriginalGroundZ(wp.x, wp.y), midS - 4, midS + 4, 'Orig Z');
+      }
+      for (const sl of (this.lastSlices || [])) {
+        if (!sl || !sl.vol) continue;
+        tryZ(sl.zBase, sl.sMin, sl.sMax, `Base Z (${sl.vol.ref})`);
+        tryZ(sl.zTop, sl.sMin, sl.sMax, `Top Z (${sl.vol.ref})`);
+      }
+      for (const ps of (this.lastPadSlices || [])) {
+        if (!ps || ps.mod.id === modId) continue;
+        const sp0 = ps.spans[0];
+        tryZ(ps.padZMid, sp0 ? sp0.sMin : midS - 4, sp0 ? sp0.sMax : midS + 4, `Pad Z (${ps.mod.name})`);
+      }
+      for (const cs of (this.lastCircSlices || [])) {
+        if (!cs || !cs.profile) continue;
+        tryZ(cs.profile.zStart, cs.sMin, cs.sMax, `Start Z (${cs.circ.name})`);
+        tryZ(cs.profile.zEnd, cs.sMin, cs.sMax, `End Z (${cs.circ.name})`);
+      }
+      if (!best) return { z: rawZ, guides: [] };
+      const sz = Math.round(best.z * 100) / 100;
+      return { z: sz, guides: [{ s1: best.s1, z1: sz, s2: best.s2, z2: sz, label: best.label }] };
+    }
+
+    _hitTestCircLiftHandle(sx, sy) {
+      const state = this.api.getState();
+      if (!state.selectedItem || state.selectedItem.kind !== 'circulation') return null;
+      for (const cs of (this.lastCircSlices || [])) {
+        if (cs.circ.id !== state.selectedItem.id) continue;
+        if (cs.startPtScreen && Math.hypot(sx - cs.startPtScreen.x, sy - cs.startPtScreen.y) <= 10) {
+          return { cs, end: 'start' };
+        }
+        if (cs.endPtScreen && Math.hypot(sx - cs.endPtScreen.x, sy - cs.endPtScreen.y) <= 10) {
+          return { cs, end: 'end' };
+        }
+      }
+      return null;
     }
 
     _hitTestTerrainModSlice(sec) {
@@ -1768,7 +1948,7 @@
           const sp0 = sl.spans[0];
           const midS = (sp0.sMin + sp0.sMax) * 0.5;
           const wpMid = eng.planeToWorld(midS, 0, basis);
-          const padZ = eng.getGroundZ(wpMid.x, wpMid.y);
+          const padZ = eng.getPadGroundZ ? eng.getPadGroundZ(wpMid.x, wpMid.y) : eng.getGroundZ(wpMid.x, wpMid.y);
           const gp = this.secToScreen(midS, padZ);
           ctx.fillStyle = isSel ? pal.ink : pal.gripFill;
           ctx.strokeStyle = pal.ink;
@@ -1784,6 +1964,8 @@
       this.lastCircSlices = [];
       const list = state.circulations || [];
       if (list.length === 0) return;
+      const eng = window.GROUNDWORK_ENGINE;
+      const basis = eng.getPlaneBasis(plane);
       const siteTools = window.GROUNDWORK_SITE_TOOLS;
       const isDark = state.theme === 'dark';
 
@@ -1791,6 +1973,15 @@
         const prof = siteTools.computeCirculationProfile(circ, state.volumes, state.useGross);
         const sl = siteTools.sliceCirculationWithPlane(circ, prof, plane, plane.projDepth || 18);
         if (!sl || !sl.topPts || sl.topPts.length < 2) continue;
+
+        const sStart = eng.worldToPlane(prof.startPt.x, prof.startPt.y, basis).s;
+        const sEnd = eng.worldToPlane(prof.endPt.x, prof.endPt.y, basis).s;
+        const pStart = this.secToScreen(sStart, prof.zStart);
+        const pEnd = this.secToScreen(sEnd, prof.zEnd);
+        sl.sStart = sStart;
+        sl.sEnd = sEnd;
+        sl.startPtScreen = pStart;
+        sl.endPtScreen = pEnd;
         this.lastCircSlices.push(sl);
 
         const isSel = !!(state.selectedItem && state.selectedItem.kind === 'circulation' && state.selectedItem.id === circ.id);
@@ -1824,6 +2015,28 @@
           });
           ctx.lineWidth = 1.0;
           ctx.stroke();
+        }
+
+        // Interactive Start / End Lift handles when selected in Section
+        if (isSel) {
+          ctx.setLineDash([]);
+          for (const hInfo of [
+            { pt: pStart, tag: 'S', fill: '#4f7d99' },
+            { pt: pEnd, tag: 'E', fill: '#c98a3b' }
+          ]) {
+            ctx.fillStyle = pal.gripFill;
+            ctx.strokeStyle = pal.ink;
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(hInfo.pt.x, hInfo.pt.y, 5.5, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = hInfo.fill;
+            ctx.font = '700 9px ui-monospace, monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText(hInfo.tag, hInfo.pt.x, hInfo.pt.y - 7);
+          }
         }
         ctx.restore();
       }

@@ -154,17 +154,31 @@
     };
   }
 
+  function _normDeg180(deg) {
+    let d = Number(deg) || 0;
+    while (d > 180) d -= 360;
+    while (d < -180) d += 360;
+    return Math.round(d * 100) / 100;
+  }
+
   function normalizeTerrainMod(raw) {
     const pts = Array.isArray(raw && raw.pts) ? raw.pts.map(p => ({ x: Number(_ptXY(p).x) || 0, y: Number(_ptXY(p).y) || 0 })) : [];
     const stats = getPolygonStats(pts);
     const mode = raw && raw.mode === 'offset' ? 'offset' : 'flatten';
     const targetZ = raw && Number.isFinite(Number(raw.targetZ)) ? Number(raw.targetZ) : Math.round(stats.avgOrigZ * 100) / 100;
     const deltaZ = raw && Number.isFinite(Number(raw.deltaZ)) ? Number(raw.deltaZ) : 0;
+    let rotDeg = 0;
+    if (raw && Number.isFinite(Number(raw.rotDeg))) {
+      rotDeg = _normDeg180(Number(raw.rotDeg));
+    } else if ((!raw || raw.shape !== 'poly') && pts.length === 4) {
+      rotDeg = _normDeg180(Math.atan2(pts[1].y - pts[0].y, pts[1].x - pts[0].x) * 180 / Math.PI);
+    }
     return {
       id: (raw && raw.id) || ('pad-' + Date.now() + '-' + Math.random().toString(36).slice(2, 5)),
       name: (raw && raw.name) || 'Terrain Pad',
       shape: raw && raw.shape === 'poly' ? 'poly' : 'rect',
       pts,
+      rotDeg,
       mode,
       targetZ,
       deltaZ,
@@ -173,6 +187,217 @@
       parapetHeight: raw && Number.isFinite(Number(raw.parapetHeight)) ? Math.max(0, Math.min(2.5, Number(raw.parapetHeight))) : 0.25,
       batterSlope: raw && Number.isFinite(Number(raw.batterSlope)) ? Math.max(0, Math.min(12, Number(raw.batterSlope))) : 0
     };
+  }
+
+  function _cleanAndCCWPoly(pts) {
+    const cleaned = [];
+    for (const raw of (pts || [])) {
+      const p = { x: Number(_ptXY(raw).x) || 0, y: Number(_ptXY(raw).y) || 0 };
+      if (!cleaned.length || Math.hypot(p.x - cleaned[cleaned.length - 1].x, p.y - cleaned[cleaned.length - 1].y) >= 0.05) {
+        cleaned.push(p);
+      }
+    }
+    if (cleaned.length >= 2 && Math.hypot(cleaned[0].x - cleaned[cleaned.length - 1].x, cleaned[0].y - cleaned[cleaned.length - 1].y) < 0.05) {
+      cleaned.pop();
+    }
+    if (cleaned.length < 3) return cleaned;
+    let signed2 = 0;
+    for (let i = 0; i < cleaned.length; i++) {
+      const a = cleaned[i];
+      const b = cleaned[(i + 1) % cleaned.length];
+      signed2 += a.x * b.y - b.x * a.y;
+    }
+    return signed2 < 0 ? cleaned.slice().reverse() : cleaned;
+  }
+
+  function getTerrainModOBB(mod) {
+    const pts = (mod && mod.pts) || [];
+    if (pts.length < 3) {
+      return { cx: 0, cy: 0, w: 1, d: 1, rot: 0, corners: [], edges: [] };
+    }
+    let signed2 = 0;
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i], b = pts[(i + 1) % pts.length];
+      signed2 += a.x * b.y - b.x * a.y;
+    }
+    const ccwSign = signed2 >= 0 ? 1 : -1;
+    const edges = [];
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % pts.length];
+      const len = Math.hypot(b.x - a.x, b.y - a.y);
+      if (len < 1e-6) continue;
+      const tx = (b.x - a.x) / len;
+      const ty = (b.y - a.y) / len;
+      // Outward normal in world XY
+      const nx = ccwSign > 0 ? ty : -ty;
+      const ny = ccwSign > 0 ? -tx : tx;
+      edges.push({ a, b, nx, ny, len, mid: { x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5 } });
+    }
+
+    let isRect = false;
+    if (pts.length === 4) {
+      const p0 = pts[0], p1 = pts[1], p2 = pts[2], p3 = pts[3];
+      const v0x = p1.x - p0.x, v0y = p1.y - p0.y;
+      const v1x = p2.x - p1.x, v1y = p2.y - p1.y;
+      const v2x = p3.x - p2.x, v2y = p3.y - p2.y;
+      const l0 = Math.hypot(v0x, v0y), l1 = Math.hypot(v1x, v1y), l2 = Math.hypot(v2x, v2y);
+      if (l0 > 0.1 && l1 > 0.1 && l2 > 0.1) {
+        const dot01 = Math.abs((v0x * v1x + v0y * v1y) / (l0 * l1));
+        const dot12 = Math.abs((v1x * v2x + v1y * v2y) / (l1 * l2));
+        if (dot01 < 0.08 && dot12 < 0.08 && Math.abs(l0 - l2) < 0.15) {
+          isRect = true;
+          const cx = (p0.x + p1.x + p2.x + p3.x) * 0.25;
+          const cy = (p0.y + p1.y + p2.y + p3.y) * 0.25;
+          const rot = Math.atan2(v0y, v0x);
+          const c = Math.cos(rot), s = Math.sin(rot);
+          const hw = l0 * 0.5, hd = l1 * 0.5;
+          const corners = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]].map(([u, v]) => ({
+            x: cx + u * c - v * s,
+            y: cy + u * s + v * c
+          }));
+          return { cx, cy, w: l0, d: l1, rot, corners, edges, isRect };
+        }
+      }
+    }
+
+    const rot = ((mod.rotDeg || 0) * Math.PI) / 180;
+    const c = Math.cos(rot), s = Math.sin(rot);
+    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+    for (const p of pts) {
+      const u = p.x * c + p.y * s;
+      const v = -p.x * s + p.y * c;
+      if (u < minU) minU = u;
+      if (u > maxU) maxU = u;
+      if (v < minV) minV = v;
+      if (v > maxV) maxV = v;
+    }
+    const cu = (minU + maxU) * 0.5, cv = (minV + maxV) * 0.5;
+    const cx = cu * c - cv * s;
+    const cy = cu * s + cv * c;
+    const w = Math.max(0.5, maxU - minU);
+    const d = Math.max(0.5, maxV - minV);
+    const hw = w * 0.5, hd = d * 0.5;
+    const corners = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]].map(([u, v]) => ({
+      x: cx + u * c - v * s,
+      y: cy + u * s + v * c
+    }));
+    return { cx, cy, w, d, rot, corners, edges, isRect };
+  }
+
+  function buildMonolithicRetainingWallData(mod) {
+    const pts = _cleanAndCCWPoly(mod && mod.pts);
+    if (pts.length < 3) return null;
+    const e = eng();
+    const stats = getPolygonStats(pts);
+    const cx = stats.cx;
+    const cy = stats.cy;
+    const padZ = mod.mode === 'offset' ? (stats.avgOrigZ + (mod.deltaZ || 0)) : mod.targetZ;
+    const n = pts.length;
+    const thick = Math.max(0.15, mod.wallThickness || 0.35);
+    const halfT = thick * 0.5;
+    const parapet = Math.max(0, mod.parapetHeight || 0);
+
+    // Outward unit normals N_i for CCW polygon: right-hand of T_i = (ty, -tx)
+    const tangents = [];
+    const normals = [];
+    const lengths = [];
+    for (let i = 0; i < n; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % n];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const len = Math.max(1e-6, Math.hypot(dx, dy));
+      const tx = dx / len;
+      const ty = dy / len;
+      tangents.push({ x: tx, y: ty });
+      normals.push({ x: ty, y: -tx });
+      lengths.push(len);
+    }
+
+    // Exact mitered inner & outer rings for razor-sharp joints with zero gaps
+    const innerPts = [];
+    const outerPts = [];
+    for (let i = 0; i < n; i++) {
+      const nPrev = normals[(i - 1 + n) % n];
+      const nCurr = normals[i];
+      let mx = nPrev.x + nCurr.x;
+      let my = nPrev.y + nCurr.y;
+      const mLen = Math.hypot(mx, my);
+      if (mLen < 1e-6) {
+        mx = nCurr.x;
+        my = nCurr.y;
+      } else {
+        mx /= mLen;
+        my /= mLen;
+      }
+      const denom = Math.max(0.35, mx * nCurr.x + my * nCurr.y);
+      const offset = halfT / denom;
+      outerPts.push({ x: pts[i].x + mx * offset, y: pts[i].y + my * offset });
+      innerPts.push({ x: pts[i].x - mx * offset, y: pts[i].y - my * offset });
+    }
+
+    const positions = [];
+    const toLocal = (wx, wy, z) => [wx - cx, z - padZ, -(wy - cy)];
+    const pushQuad = (a, b, cPt, dPt) => {
+      positions.push(
+        a[0], a[1], a[2], b[0], b[1], b[2], cPt[0], cPt[1], cPt[2],
+        a[0], a[1], a[2], cPt[0], cPt[1], cPt[2], dPt[0], dPt[1], dPt[2]
+      );
+    };
+
+    for (let i = 0; i < n; i++) {
+      const j = (i + 1) % n;
+      const len = lengths[i];
+      const nSeg = Math.max(2, Math.min(24, Math.ceil(len / 1.0)));
+      const aC = pts[i], bC = pts[j];
+      const aOut = outerPts[i], bOut = outerPts[j];
+      const aIn = innerPts[i], bIn = innerPts[j];
+
+      const zLows = [];
+      const zHighs = [];
+      for (let k = 0; k <= nSeg; k++) {
+        const t = k / nSeg;
+        const wx = aC.x + (bC.x - aC.x) * t;
+        const wy = aC.y + (bC.y - aC.y) * t;
+        const origZ = e.getOriginalGroundZ(wx, wy);
+        const modZ = mod.mode === 'offset' ? (origZ + (mod.deltaZ || 0)) : mod.targetZ;
+        zLows.push(Math.min(origZ, modZ) - 0.40);
+        zHighs.push(Math.max(origZ, modZ) + parapet);
+      }
+
+      for (let k = 0; k < nSeg; k++) {
+        const t0 = k / nSeg;
+        const t1 = (k + 1) / nSeg;
+        const ox0 = aOut.x + (bOut.x - aOut.x) * t0;
+        const oy0 = aOut.y + (bOut.y - aOut.y) * t0;
+        const ox1 = aOut.x + (bOut.x - aOut.x) * t1;
+        const oy1 = aOut.y + (bOut.y - aOut.y) * t1;
+
+        const ix0 = aIn.x + (bIn.x - aIn.x) * t0;
+        const iy0 = aIn.y + (bIn.y - aIn.y) * t0;
+        const ix1 = aIn.x + (bIn.x - aIn.x) * t1;
+        const iy1 = aIn.y + (bIn.y - aIn.y) * t1;
+
+        const outA_bot = toLocal(ox0, oy0, zLows[k]);
+        const outB_bot = toLocal(ox1, oy1, zLows[k + 1]);
+        const outB_top = toLocal(ox1, oy1, zHighs[k + 1]);
+        const outA_top = toLocal(ox0, oy0, zHighs[k]);
+
+        const inA_bot = toLocal(ix0, iy0, zLows[k]);
+        const inB_bot = toLocal(ix1, iy1, zLows[k + 1]);
+        const inB_top = toLocal(ix1, iy1, zHighs[k + 1]);
+        const inA_top = toLocal(ix0, iy0, zHighs[k]);
+
+        // Continuous outward-facing right-handed quads across the entire wall ribbon
+        pushQuad(outA_bot, outB_bot, outB_top, outA_top); // Outer face
+        pushQuad(inB_bot, inA_bot, inA_top, inB_top);     // Inner face
+        pushQuad(outA_top, outB_top, inB_top, inA_top);   // Top coping
+        pushQuad(inA_bot, inB_bot, outB_bot, outA_bot);   // Bottom footing
+      }
+    }
+
+    return { positions, innerPts, outerPts, cx, cy, padZ };
   }
 
   function computeTerrainModEarthwork(mod) {
@@ -377,6 +602,9 @@
       width: raw && Number.isFinite(Number(raw.width)) ? Math.max(0.9, Number(raw.width)) : defWidth,
       rot: raw && Number.isFinite(Number(raw.rot)) ? Number(raw.rot) : 0,
       autoTerrainZ: raw && raw.autoTerrainZ !== undefined ? !!raw.autoTerrainZ : true,
+      startLift: raw && Number.isFinite(Number(raw.startLift)) ? Math.max(-10, Math.min(15, Number(raw.startLift))) : 0,
+      endLift: raw && Number.isFinite(Number(raw.endLift)) ? Math.max(-10, Math.min(15, Number(raw.endLift))) : 0,
+      cutSoil: raw && raw.cutSoil !== undefined ? !!raw.cutSoil : true,
       zStart: raw && Number.isFinite(Number(raw.zStart)) ? Number(raw.zStart) : 1975,
       zEnd: raw && Number.isFinite(Number(raw.zEnd)) ? Number(raw.zEnd) : 1977,
       riserHeight: raw && Number.isFinite(Number(raw.riserHeight)) ? Math.max(0.10, Math.min(0.24, Number(raw.riserHeight))) : 0.165,
@@ -440,19 +668,25 @@
     const ex = circ.x + L * 0.5 * c;
     const ey = circ.y + L * 0.5 * s;
 
+    const adjS = findAdjacentSupportZ(sx, sy, volumes, useGross);
+    const adjE = findAdjacentSupportZ(ex, ey, volumes, useGross);
+    const baseStartZ = adjS !== null ? adjS : e.getPadGroundZ(sx, sy);
+    const baseEndZ = adjE !== null ? adjE : e.getPadGroundZ(ex, ey);
+
     let zStart = circ.zStart;
     let zEnd = circ.zEnd;
     if (circ.autoTerrainZ) {
-      const adjS = findAdjacentSupportZ(sx, sy, volumes, useGross);
-      const adjE = findAdjacentSupportZ(ex, ey, volumes, useGross);
-      zStart = Math.round((adjS !== null ? adjS : e.getGroundZ(sx, sy)) * 100) / 100;
-      zEnd = Math.round((adjE !== null ? adjE : e.getGroundZ(ex, ey)) * 100) / 100;
+      zStart = Math.round((baseStartZ + (circ.startLift || 0)) * 100) / 100;
+      zEnd = Math.round((baseEndZ + (circ.endLift || 0)) * 100) / 100;
     }
+    const effectiveStartLift = Math.round((zStart - baseStartZ) * 100) / 100;
+    const effectiveEndLift = Math.round((zEnd - baseEndZ) * 100) / 100;
 
     const dz = zEnd - zStart;
     const absDZ = Math.abs(dz);
     const segments = [];
     const steps = [];
+    const thick = circ.slabThickness || 0.25;
 
     if (circ.kind === 'ramp') {
       const lLen = Math.min(L * 0.25, Math.max(0.9, circ.landingLength || 1.4));
@@ -497,11 +731,16 @@
         }
         return u <= 0 ? zStart : zEnd;
       };
+      const soffitZAtU = (u) => surfaceZAtU(u) - thick;
 
       return {
         kind: 'ramp',
         zStart,
         zEnd,
+        baseStartZ,
+        baseEndZ,
+        effectiveStartLift,
+        effectiveEndLift,
         dz,
         absDZ,
         length: L,
@@ -514,6 +753,7 @@
         segments,
         steps,
         surfaceZAtU,
+        soffitZAtU,
         minZ: Math.min(zStart, zEnd),
         maxZ: Math.max(zStart, zEnd),
         startPt: { x: sx, y: sy },
@@ -557,11 +797,26 @@
         }
         return u <= 0 ? zStart : zEnd;
       };
+      const soffitZAtU = (u) => {
+        for (const st of steps) {
+          if (u >= st.u0 - 1e-6 && u <= st.u1 + 1e-6) {
+            const zLow = st.isLanding
+              ? st.zTop
+              : Math.min(st.zTop, st.zStartStep !== undefined ? st.zStartStep : st.zTop, st.zEndStep !== undefined ? st.zEndStep : st.zTop);
+            return zLow - thick;
+          }
+        }
+        return surfaceZAtU(u) - thick;
+      };
 
       return {
         kind: 'stair',
         zStart,
         zEnd,
+        baseStartZ,
+        baseEndZ,
+        effectiveStartLift,
+        effectiveEndLift,
         dz,
         absDZ,
         length: L,
@@ -576,6 +831,7 @@
         segments,
         steps,
         surfaceZAtU,
+        soffitZAtU,
         minZ: Math.min(zStart, zEnd),
         maxZ: Math.max(zStart, zEnd),
         startPt: { x: sx, y: sy },
@@ -600,13 +856,12 @@
     let cutVol = 0, fillVol = 0, maxCutDepth = 0, maxFillHeight = 0;
     for (let iu = 0; iu < nu; iu++) {
       const lu = -L * 0.5 + (iu + 0.5) * du;
-      const zSurf = profile.surfaceZAtU(lu);
-      const zPad = zSurf - soffitOff * 0.4;
+      const zPad = profile.soffitZAtU ? profile.soffitZAtU(lu) : (profile.surfaceZAtU(lu) - soffitOff);
       for (let iv = 0; iv < nv; iv++) {
         const lv = -W * 0.5 + (iv + 0.5) * dv;
         const wx = circ.x + lu * c - lv * s;
         const wy = circ.y + lu * s + lv * c;
-        const gz = e.getGroundZ(wx, wy);
+        const gz = e.getPadGroundZ(wx, wy);
         const diff = gz - zPad;
         if (diff > 0) {
           cutVol += diff * dA;
@@ -961,6 +1216,8 @@
     rectIntersectsPolygon,
     getPolygonStats,
     normalizeTerrainMod,
+    getTerrainModOBB,
+    buildMonolithicRetainingWallData,
     computeTerrainModEarthwork,
     sliceTerrainModWithPlane,
     normalizeCirculation,
