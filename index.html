@@ -315,6 +315,15 @@
             <input type="number" id="cbFloorH" step="0.1" min="1.5" max="14" value="3.0" />
           </div>
         </div>
+        <div class="field">
+          <label for="cbRoofType">Roof Type</label>
+          <select id="cbRoofType">
+            <option value="flat" selected>Flat</option>
+            <option value="skillion">Skillion</option>
+            <option value="gable">Gable</option>
+            <option value="hip">Hip</option>
+          </select>
+        </div>
         <div class="row-between" style="justify-content:flex-end;gap:8px;padding-top:4px;">
           <button class="btn subtle" type="button" id="btnCancelCustomModal">Cancel</button>
           <button class="btn active" type="submit">Create &amp; Place Bubble</button>

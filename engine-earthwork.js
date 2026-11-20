@@ -256,19 +256,64 @@
     return { basis, pts };
   }
 
-  function sliceVolumeWithPlane(vol, plane, useGross, projDepth = 18) {
-    const basis = getPlaneBasis(plane);
-    const corners = getFootprintCorners(vol, useGross);
-    const dims = getEffectiveDims(vol, useGross);
-    const localPts = corners.map(p => worldToPlane(p.x, p.y, basis));
+  function getRoofSpec(vol) {
+    const validTypes = ['flat', 'skillion', 'gable', 'hip'];
+    const rawType = vol && vol.roofType ? String(vol.roofType).toLowerCase() : 'flat';
+    const type = validTypes.includes(rawType) ? rawType : 'flat';
+    const rawAng = vol && Number.isFinite(Number(vol.roofAngle)) ? Number(vol.roofAngle) : 22;
+    const angle = Math.max(5, Math.min(55, rawAng));
+    const rawDir = vol && Number.isFinite(Number(vol.roofDir)) ? Number(vol.roofDir) : 0;
+    const dir = ((Math.round(rawDir / 90) * 90) % 360 + 360) % 360;
+    const rawOv = vol && Number.isFinite(Number(vol.roofOverhang)) ? Number(vol.roofOverhang) : 0;
+    const overhang = Math.max(0, Math.min(2.5, rawOv));
+    return { type, angle, dir, overhang };
+  }
 
-    // Intersect edges with depth === 0 (cut plane)
+  function getRoofRiseAtLocal(lx, ly, w, d, roof) {
+    if (!roof || roof.type === 'flat') return 0;
+    const hw = w * 0.5;
+    const hd = d * 0.5;
+    const t = Math.tan(roof.angle * Math.PI / 180);
+    if (roof.type === 'skillion') {
+      if (roof.dir === 0) return (hd - ly) * t;
+      if (roof.dir === 180) return (ly + hd) * t;
+      if (roof.dir === 90) return (hw - lx) * t;
+      return (lx + hw) * t; // 270
+    }
+    if (roof.type === 'gable') {
+      if (roof.dir === 0 || roof.dir === 180) return (hd - Math.abs(ly)) * t;
+      return (hw - Math.abs(lx)) * t;
+    }
+    // hip
+    return Math.min(hw - Math.abs(lx), hd - Math.abs(ly)) * t;
+  }
+
+  function getRoofApexRise(dims, roof) {
+    if (!roof || roof.type === 'flat') return 0;
+    const t = Math.tan(roof.angle * Math.PI / 180);
+    if (roof.type === 'skillion') {
+      return ((roof.dir === 0 || roof.dir === 180) ? dims.d : dims.w) * t;
+    }
+    if (roof.type === 'gable') {
+      return ((roof.dir === 0 || roof.dir === 180) ? dims.d * 0.5 : dims.w * 0.5) * t;
+    }
+    return Math.min(dims.w, dims.d) * 0.5 * t;
+  }
+
+  function intersectExpandedRectWithPlane(vol, wExt, dExt, basis) {
+    const hw = wExt * 0.5;
+    const hd = dExt * 0.5;
+    const c = Math.cos(vol.rot || 0);
+    const s = Math.sin(vol.rot || 0);
+    const local = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]];
+    const localPts = local.map(([lx, ly]) => worldToPlane(
+      vol.x + lx * c - ly * s,
+      vol.y + lx * s + ly * c,
+      basis
+    ));
     const cutS = [];
-    let minDepth = Infinity;
-    let maxDepth = -Infinity;
-    let minSAll = Infinity;
-    let maxSAll = -Infinity;
-
+    let minDepth = Infinity, maxDepth = -Infinity;
+    let minSAll = Infinity, maxSAll = -Infinity;
     for (let i = 0; i < localPts.length; i++) {
       const a = localPts[i];
       const b = localPts[(i + 1) % localPts.length];
@@ -276,24 +321,115 @@
       if (a.depth > maxDepth) maxDepth = a.depth;
       if (a.s < minSAll) minSAll = a.s;
       if (a.s > maxSAll) maxSAll = a.s;
-
       if ((a.depth >= 0 && b.depth <= 0) || (a.depth <= 0 && b.depth >= 0)) {
         const denom = a.depth - b.depth;
         if (Math.abs(denom) < 1e-9) {
-          if (Math.abs(a.depth) < 1e-6) {
-            cutS.push(a.s, b.s);
-          }
+          if (Math.abs(a.depth) < 1e-6) cutS.push(a.s, b.s);
         } else {
           const t = a.depth / denom;
-          if (t >= -1e-6 && t <= 1 + 1e-6) {
-            cutS.push(a.s + t * (b.s - a.s));
-          }
+          if (t >= -1e-6 && t <= 1 + 1e-6) cutS.push(a.s + t * (b.s - a.s));
         }
       }
     }
-
     const isCut = cutS.length >= 2 && (Math.max(...cutS) - Math.min(...cutS)) > 0.05;
-    const isProjected = !isCut && maxDepth > 0 && minDepth <= projDepth;
+    return { cutS, isCut, minDepth, maxDepth, minSAll, maxSAll };
+  }
+
+  function buildProjectedRoofSilhouette(vol, dims, roof, zEave, basis, expandOv) {
+    const hw = dims.w * 0.5 + expandOv;
+    const hd = dims.d * 0.5 + expandOv;
+    const hwRef = dims.w * 0.5;
+    const hdRef = dims.d * 0.5;
+    const c = Math.cos(vol.rot || 0);
+    const sRot = Math.sin(vol.rot || 0);
+    const toSZ = (lx, ly) => {
+      const wx = vol.x + lx * c - ly * sRot;
+      const wy = vol.y + lx * sRot + ly * c;
+      const lp = worldToPlane(wx, wy, basis);
+      const z = zEave + getRoofRiseAtLocal(lx, ly, dims.w, dims.d, roof);
+      return { s: lp.s, z };
+    };
+
+    const edges = [];
+    const addPoly = (pts) => {
+      for (let i = 0; i < pts.length; i++) {
+        edges.push([pts[i], pts[(i + 1) % pts.length]]);
+      }
+    };
+
+    const p00 = toSZ(-hw, -hd), p10 = toSZ(hw, -hd), p11 = toSZ(hw, hd), p01 = toSZ(-hw, hd);
+    if (roof.type === 'flat' || roof.type === 'skillion') {
+      addPoly([p00, p10, p11, p01]);
+    } else if (roof.type === 'gable') {
+      if (roof.dir === 0 || roof.dir === 180) {
+        const rL = toSZ(-hw, 0), rR = toSZ(hw, 0);
+        edges.push([p00, p10], [p10, rR], [rR, p11], [p11, p01], [p01, rL], [rL, p00], [rL, rR]);
+      } else {
+        const rB = toSZ(0, -hd), rT = toSZ(0, hd);
+        edges.push([p00, rB], [rB, p10], [p10, p11], [p11, rT], [rT, p01], [p01, p00], [rB, rT]);
+      }
+    } else {
+      if (hwRef >= hdRef) {
+        const rx = Math.max(0, hwRef - hdRef);
+        const rL = toSZ(-rx, 0), rR = toSZ(rx, 0);
+        edges.push([p00, p10], [p10, p11], [p11, p01], [p01, p00], [p00, rL], [p01, rL], [p10, rR], [p11, rR], [rL, rR]);
+      } else {
+        const ry = Math.max(0, hdRef - hwRef);
+        const rB = toSZ(0, -ry), rT = toSZ(0, ry);
+        edges.push([p00, p10], [p10, p11], [p11, p01], [p01, p00], [p00, rB], [p10, rB], [p01, rT], [p11, rT], [rB, rT]);
+      }
+    }
+
+    // Collect upper envelope breakpoints (all vertices + pairwise edge intersections)
+    const candS = [];
+    for (const [a, b] of edges) candS.push(a.s, b.s);
+    for (let i = 0; i < edges.length; i++) {
+      const [a, b] = edges[i];
+      for (let j = i + 1; j < edges.length; j++) {
+        const [cPt, dPt] = edges[j];
+        const aMin = Math.min(a.s, b.s), aMax = Math.max(a.s, b.s);
+        const cMin = Math.min(cPt.s, dPt.s), cMax = Math.max(cPt.s, dPt.s);
+        if (aMax < cMin || cMax < aMin) continue;
+        const dx1 = b.s - a.s, dz1 = b.z - a.z;
+        const dx2 = dPt.s - cPt.s, dz2 = dPt.z - cPt.z;
+        const den = dx1 * dz2 - dz1 * dx2;
+        if (Math.abs(den) < 1e-8) continue;
+        const t = ((cPt.s - a.s) * dz2 - (cPt.z - a.z) * dx2) / den;
+        const u = ((cPt.s - a.s) * dz1 - (cPt.z - a.z) * dx1) / den;
+        if (t > 1e-5 && t < 1 - 1e-5 && u > 1e-5 && u < 1 - 1e-5) {
+          candS.push(a.s + t * dx1);
+        }
+      }
+    }
+    candS.sort((a, b) => a - b);
+    const uniqS = [];
+    for (const sv of candS) {
+      if (!uniqS.length || sv - uniqS[uniqS.length - 1] > 1e-4) uniqS.push(sv);
+    }
+
+    return uniqS.map(sv => {
+      let maxZ = zEave;
+      for (const [a, b] of edges) {
+        const lo = Math.min(a.s, b.s) - 1e-5, hi = Math.max(a.s, b.s) + 1e-5;
+        if (sv >= lo && sv <= hi) {
+          const span = b.s - a.s;
+          const zv = Math.abs(span) < 1e-6 ? Math.max(a.z, b.z) : (a.z + ((sv - a.s) / span) * (b.z - a.z));
+          if (zv > maxZ) maxZ = zv;
+        }
+      }
+      return { s: sv, z: maxZ };
+    });
+  }
+
+  function sliceVolumeWithPlane(vol, plane, useGross, projDepth = 18) {
+    const basis = getPlaneBasis(plane);
+    const dims = getEffectiveDims(vol, useGross);
+    const roof = getRoofSpec(vol);
+    const apexRise = getRoofApexRise(dims, roof);
+    const wallCut = intersectExpandedRectWithPlane(vol, dims.w, dims.d, basis);
+
+    const isCut = wallCut.isCut;
+    const isProjected = !isCut && wallCut.maxDepth > 0 && wallCut.minDepth <= projDepth;
 
     if (!isCut && !isProjected) {
       return null;
@@ -304,23 +440,95 @@
     const zTop = vol.zBase + dims.totalHeight;
 
     if (!isCut) {
+      const wallRoofPts = buildProjectedRoofSilhouette(vol, dims, roof, zTop, basis, 0);
+      const roofCapPts = roof.overhang > 0.01
+        ? buildProjectedRoofSilhouette(vol, dims, roof, zTop, basis, roof.overhang)
+        : wallRoofPts;
+      const zPeak = Math.max(zTop + apexRise, ...wallRoofPts.map(p => p.z));
+      const sMid = (wallCut.minSAll + wallCut.maxSAll) * 0.5;
+      const midPt = wallRoofPts.reduce((best, pt) => Math.abs(pt.s - sMid) < Math.abs(best.s - sMid) ? pt : best, wallRoofPts[0]);
       return {
         vol,
+        roof,
         kind: 'projected',
-        sMin: minSAll,
-        sMax: maxSAll,
+        sMin: wallCut.minSAll,
+        sMax: wallCut.maxSAll,
+        sRoofMin: roofCapPts[0].s,
+        sRoofMax: roofCapPts[roofCapPts.length - 1].s,
         zBase,
         zTop,
+        zPeak,
+        zRoofMid: midPt ? midPt.z : zTop,
+        wallRoofPts,
+        roofCapPts,
         dims,
         earth,
-        distBehind: Math.max(0, minDepth),
+        distBehind: Math.max(0, wallCut.minDepth),
         cutPolys: [],
         fillPolys: []
       };
     }
 
-    const sMin = Math.min(...cutS);
-    const sMax = Math.max(...cutS);
+    const sMin = Math.min(...wallCut.cutS);
+    const sMax = Math.max(...wallCut.cutS);
+
+    // Cut roof cap span including overhang
+    let sRoofMin = sMin, sRoofMax = sMax;
+    if (roof.overhang > 0.01) {
+      const capCut = intersectExpandedRectWithPlane(vol, dims.w + 2 * roof.overhang, dims.d + 2 * roof.overhang, basis);
+      if (capCut.isCut) {
+        sRoofMin = Math.min(...capCut.cutS);
+        sRoofMax = Math.max(...capCut.cutS);
+      }
+    }
+
+    // Parametric local coords along the cut line (depth === 0)
+    const c = Math.cos(vol.rot || 0);
+    const sR = Math.sin(vol.rot || 0);
+    const dx0 = basis.cx - vol.x, dy0 = basis.cy - vol.y;
+    const lx0 = dx0 * c + dy0 * sR;
+    const ly0 = -dx0 * sR + dy0 * c;
+    const dlx = basis.tx * c + basis.ty * sR;
+    const dly = -basis.tx * sR + basis.ty * c;
+    const hw = dims.w * 0.5, hd = dims.d * 0.5;
+
+    const creaseBreaks = [];
+    const addSolve = (a, b) => {
+      if (Math.abs(a) > 1e-8) creaseBreaks.push(-b / a);
+    };
+    if (roof.type === 'gable') {
+      if (roof.dir === 0 || roof.dir === 180) addSolve(dly, ly0);
+      else addSolve(dlx, lx0);
+    } else if (roof.type === 'hip') {
+      const k = hw - hd;
+      addSolve(dlx - dly, lx0 - ly0 - k);
+      addSolve(dlx + dly, lx0 + ly0 - k);
+      addSolve(dlx + dly, lx0 + ly0 + k);
+      addSolve(dlx - dly, lx0 - ly0 + k);
+    }
+
+    const sampleSpan = (aS, bS) => {
+      const ptsS = [aS, bS];
+      for (const sb of creaseBreaks) {
+        if (sb > aS + 1e-4 && sb < bS - 1e-4) ptsS.push(sb);
+      }
+      ptsS.sort((a, b) => a - b);
+      const out = [];
+      for (const sv of ptsS) {
+        if (!out.length || sv - out[out.length - 1].s > 1e-4) {
+          const z = zTop + getRoofRiseAtLocal(lx0 + sv * dlx, ly0 + sv * dly, dims.w, dims.d, roof);
+          out.push({ s: sv, z });
+        }
+      }
+      return out;
+    };
+
+    const wallRoofPts = sampleSpan(sMin, sMax);
+    const roofCapPts = roof.overhang > 0.01 ? sampleSpan(sRoofMin, sRoofMax) : wallRoofPts;
+    const sMid = (sMin + sMax) * 0.5;
+    const zRoofMid = zTop + getRoofRiseAtLocal(lx0 + sMid * dlx, ly0 + sMid * dly, dims.w, dims.d, roof);
+    const zPeak = Math.max(zTop, ...wallRoofPts.map(p => p.z));
+
     const segLen = sMax - sMin;
     const steps = Math.max(8, Math.min(80, Math.ceil(segLen / 0.15)));
     const samples = [];
@@ -337,11 +545,18 @@
 
     return {
       vol,
+      roof,
       kind: 'cut',
       sMin,
       sMax,
+      sRoofMin,
+      sRoofMax,
       zBase,
       zTop,
+      zPeak,
+      zRoofMid,
+      wallRoofPts,
+      roofCapPts,
       dims,
       earth,
       distBehind: 0,
@@ -521,6 +736,9 @@
   window.GROUNDWORK_ENGINE = {
     getGroundZ,
     getEffectiveDims,
+    getRoofSpec,
+    getRoofRiseAtLocal,
+    getRoofApexRise,
     getFootprintCorners,
     pointInFootprint,
     pointInSiteBoundary,

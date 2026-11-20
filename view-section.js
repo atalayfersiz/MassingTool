@@ -37,8 +37,10 @@
       }
       for (const v of this.api.getState().volumes) {
         const dims = eng.getEffectiveDims(v, this.api.getState().useGross);
+        const roof = eng.getRoofSpec(v);
+        const apexRise = eng.getRoofApexRise(dims, roof);
         if (v.zBase < minZ) minZ = v.zBase;
-        if (v.zBase + dims.totalHeight > maxZ) maxZ = v.zBase + dims.totalHeight;
+        if (v.zBase + dims.totalHeight + apexRise > maxZ) maxZ = v.zBase + dims.totalHeight + apexRise;
       }
       const w = this.canvas.clientWidth || 800;
       const h = this.canvas.clientHeight || 360;
@@ -280,6 +282,7 @@
               origFloorHeight: vol.floorHeight || 3.0,
               floors: Math.max(1, vol.floors || 1),
               zBase: vol.zBase,
+              roofOffsetAtGrip: (hit.slice.zRoofMid || hit.slice.zTop) - hit.slice.zTop,
               startZ: sec.z
             };
           } else {
@@ -413,7 +416,7 @@
         }
 
         if (this.dragState.type === 'height') {
-          const totalH = Math.max(1.5, Math.min(24, sec.z - this.dragState.zBase));
+          const totalH = Math.max(1.5, Math.min(24, sec.z - this.dragState.zBase - (this.dragState.roofOffsetAtGrip || 0)));
           const snappedTotal = Math.round(totalH * 10) / 10;
           const newFloorH = Math.max(1.2, Math.round((snappedTotal / this.dragState.floors) * 10) / 10);
           this.api.updateVolume(this.dragState.id, { floorHeight: newFloorH }, { silentUndo: true });
@@ -549,16 +552,22 @@
         ...this.lastSlices.filter(sl => sl.kind === 'projected').reverse()
       ];
       for (const sl of ordered) {
-        const pTop = this.secToScreen((sl.sMin + sl.sMax) * 0.5, sl.zTop);
-        const pLeft = this.secToScreen(sl.sMin, sl.zTop);
-        const pRight = this.secToScreen(sl.sMax, sl.zBase);
-
-        // Top-edge height handle zone (within 7 px of zTop across [sMin..sMax])
-        if (sx >= pLeft.x - 4 && sx <= pRight.x + 4 && Math.abs(sy - pTop.y) <= 7) {
+        const sMid = (sl.sMin + sl.sMax) * 0.5;
+        const pGrip = this.secToScreen(sMid, sl.zRoofMid || sl.zTop);
+        if (Math.abs(sx - pGrip.x) <= 13 && Math.abs(sy - pGrip.y) <= 7) {
           return { slice: sl, mode: 'height' };
         }
-        // Body
-        if (sec.s >= sl.sMin && sec.s <= sl.sMax && sec.z >= sl.zBase && sec.z <= sl.zTop) {
+        // Check along top roof segments within [sMin..sMax]
+        const topPts = sl.wallRoofPts || [{ s: sl.sMin, z: sl.zTop }, { s: sl.sMax, z: sl.zTop }];
+        for (let i = 0; i < topPts.length - 1; i++) {
+          const a = this.secToScreen(topPts[i].s, topPts[i].z);
+          const b = this.secToScreen(topPts[i + 1].s, topPts[i + 1].z);
+          if (this._distPointToSegment(sx, sy, a.x, a.y, b.x, b.y) <= 6) {
+            return { slice: sl, mode: 'height' };
+          }
+        }
+        // Body (up to sloped roof top or zPeak)
+        if (sec.s >= sl.sMin && sec.s <= sl.sMax && sec.z >= sl.zBase && sec.z <= (sl.zPeak || sl.zTop)) {
           return { slice: sl, mode: 'move' };
         }
       }
@@ -706,26 +715,53 @@
       // 1. Draw projected spaces behind cut plane first
       for (const sl of slices) {
         if (sl.kind !== 'projected') continue;
-        const p1 = this.secToScreen(sl.sMin, sl.zTop);
-        const p2 = this.secToScreen(sl.sMax, sl.zBase);
-        const bw = Math.max(4, p2.x - p1.x);
-        const bh = Math.max(4, p2.y - p1.y);
+        const pEaveLeft = this.secToScreen(sl.sMin, sl.zTop);
+        const pBaseRight = this.secToScreen(sl.sMax, sl.zBase);
+        const bw = Math.max(4, pBaseRight.x - pEaveLeft.x);
+        const bh = Math.max(4, pBaseRight.y - pEaveLeft.y);
         const cat = prog.getSpaceStyle(sl.vol);
         const isSel = state.selectedIds.includes(sl.vol.id);
+        const topPts = (sl.wallRoofPts && sl.wallRoofPts.length >= 2)
+          ? sl.wallRoofPts
+          : [{ s: sl.sMin, z: sl.zTop }, { s: sl.sMax, z: sl.zTop }];
         ctx.save();
+        ctx.beginPath();
+        const b0 = this.secToScreen(sl.sMin, sl.zBase);
+        const b1 = this.secToScreen(sl.sMax, sl.zBase);
+        ctx.moveTo(b0.x, b0.y);
+        ctx.lineTo(b1.x, b1.y);
+        for (let i = topPts.length - 1; i >= 0; i--) {
+          const sp = this.secToScreen(topPts[i].s, topPts[i].z);
+          ctx.lineTo(sp.x, sp.y);
+        }
+        ctx.closePath();
         ctx.fillStyle = this._rgba(cat.color, 0.12);
         ctx.strokeStyle = isSel ? pal.ink : this._rgba(cat.color, 0.65);
         ctx.lineWidth = isSel ? 1.5 : 1;
         ctx.setLineDash([4, 3]);
-        ctx.fillRect(p1.x, p1.y, bw, bh);
-        ctx.strokeRect(p1.x, p1.y, bw, bh);
+        ctx.fill();
+        ctx.stroke();
+
+        // Projected roof cap overhang line
+        const capPts = sl.roofCapPts || topPts;
+        if (sl.roof && (sl.roof.type !== 'flat' || sl.roof.overhang > 0.01) && capPts.length >= 2) {
+          ctx.beginPath();
+          for (let i = 0; i < capPts.length; i++) {
+            const sp = this.secToScreen(capPts[i].s, capPts[i].z);
+            if (i === 0) ctx.moveTo(sp.x, sp.y);
+            else ctx.lineTo(sp.x, sp.y);
+          }
+          ctx.strokeStyle = isSel ? pal.ink : this._rgba(cat.color, 0.8);
+          ctx.lineWidth = 1.6;
+          ctx.stroke();
+        }
         ctx.setLineDash([]);
         if (bw > 32 && bh > 18) {
           ctx.fillStyle = pal.projText;
           ctx.font = '10px sans-serif';
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
-          ctx.fillText(`${sl.vol.ref} ${sl.vol.short} (${sl.dims.totalArea.toFixed(0)}m²)`, p1.x + bw * 0.5, p1.y + bh * 0.5);
+          ctx.fillText(`${sl.vol.ref} ${sl.vol.short} (${sl.dims.totalArea.toFixed(0)}m²)`, pEaveLeft.x + bw * 0.5, pEaveLeft.y + bh * 0.5);
         }
         ctx.restore();
       }
@@ -804,10 +840,24 @@
         const bh = Math.max(6, p2.y - p1.y);
         const cat = prog.getSpaceStyle(sl.vol);
         const isSel = state.selectedIds.includes(sl.vol.id);
+        const topPts = (sl.wallRoofPts && sl.wallRoofPts.length >= 2)
+          ? sl.wallRoofPts
+          : [{ s: sl.sMin, z: sl.zTop }, { s: sl.sMax, z: sl.zTop }];
 
         ctx.save();
+        // Closed polygonal volume + pitched roof profile
+        ctx.beginPath();
+        const b0 = this.secToScreen(sl.sMin, sl.zBase);
+        const b1 = this.secToScreen(sl.sMax, sl.zBase);
+        ctx.moveTo(b0.x, b0.y);
+        ctx.lineTo(b1.x, b1.y);
+        for (let i = topPts.length - 1; i >= 0; i--) {
+          const sp = this.secToScreen(topPts[i].s, topPts[i].z);
+          ctx.lineTo(sp.x, sp.y);
+        }
+        ctx.closePath();
         ctx.fillStyle = this._rgba(cat.color, isSel ? 0.36 : 0.24);
-        ctx.fillRect(p1.x, p1.y, bw, bh);
+        ctx.fill();
 
         // Floor dividers when multi-floor
         if (sl.dims.floors > 1) {
@@ -823,17 +873,56 @@
           }
         }
 
-        ctx.strokeStyle = isSel ? pal.ink : cat.color;
-        ctx.lineWidth = isSel ? 2.3 : 1.7;
-        ctx.strokeRect(p1.x, p1.y, bw, bh);
+        // Subtle dashed eave line when roof is pitched
+        if (sl.roof && sl.roof.type !== 'flat') {
+          ctx.save();
+          ctx.strokeStyle = pal.floorLine;
+          ctx.lineWidth = 0.9;
+          ctx.setLineDash([3, 3]);
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p1.x + bw, p1.y);
+          ctx.stroke();
+          ctx.restore();
+        }
 
-        // Interactive top-edge height drag grip
+        // Building perimeter stroke
+        ctx.beginPath();
+        ctx.moveTo(b0.x, b0.y);
+        ctx.lineTo(b1.x, b1.y);
+        for (let i = topPts.length - 1; i >= 0; i--) {
+          const sp = this.secToScreen(topPts[i].s, topPts[i].z);
+          ctx.lineTo(sp.x, sp.y);
+        }
+        ctx.closePath();
+        ctx.strokeStyle = isSel ? pal.ink : cat.color;
+        ctx.lineWidth = isSel ? 2.2 : 1.6;
+        ctx.stroke();
+
+        // Thickened overhanging roof cap line
+        const capPts = sl.roofCapPts || topPts;
+        if (sl.roof && (sl.roof.type !== 'flat' || sl.roof.overhang > 0.01) && capPts.length >= 2) {
+          ctx.beginPath();
+          for (let i = 0; i < capPts.length; i++) {
+            const sp = this.secToScreen(capPts[i].s, capPts[i].z);
+            if (i === 0) ctx.moveTo(sp.x, sp.y);
+            else ctx.lineTo(sp.x, sp.y);
+          }
+          ctx.strokeStyle = isSel ? pal.ink : this._darkenHex(cat.color, state.theme === 'dark' ? 0.85 : 0.68);
+          ctx.lineWidth = isSel ? 3.4 : 2.8;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.stroke();
+        }
+
+        // Interactive top-edge height drag grip placed at mid roof elevation
+        const gripY = this.secToScreen((sl.sMin + sl.sMax) * 0.5, sl.zRoofMid || sl.zTop).y;
         ctx.fillStyle = isSel ? pal.ink : pal.gripFill;
         ctx.strokeStyle = pal.ink;
         ctx.lineWidth = 1.2;
         const gx = p1.x + bw * 0.5;
-        ctx.fillRect(gx - 10, p1.y - 3, 20, 6);
-        ctx.strokeRect(gx - 10, p1.y - 3, 20, 6);
+        ctx.fillRect(gx - 10, gripY - 3, 20, 6);
+        ctx.strokeRect(gx - 10, gripY - 3, 20, 6);
 
         // Clean Section Label: Space Name + Area + Height (NO keywords)
         const cx = p1.x + bw * 0.5;
@@ -852,7 +941,7 @@
           ctx.fillText(metaTxt, cx, cy + 7);
         } else {
           ctx.font = '600 10px sans-serif';
-          ctx.fillText(`${nameTxt} · ${sl.dims.totalArea.toFixed(0)}m²`, cx, p1.y - 11);
+          ctx.fillText(`${nameTxt} · ${sl.dims.totalArea.toFixed(0)}m²`, cx, gripY - 11);
         }
 
         // Earthwork Cut & Fill volume badges right beneath/beside the sliced volume
@@ -1300,7 +1389,21 @@
         const bw = Math.max(4, parseFloat(p2.x) - parseFloat(p1.x));
         const bh = Math.max(4, parseFloat(p2.y) - parseFloat(p1.y));
         const cat = prog.getSpaceStyle(sl.vol);
-        parts.push(`<rect x="${p1.x}" y="${p1.y}" width="${bw.toFixed(2)}" height="${bh.toFixed(2)}" fill="${cat.color}" fill-opacity="0.25" stroke="${cat.color}" stroke-width="1.6"/>`);
+        const topPts = (sl.wallRoofPts && sl.wallRoofPts.length >= 2)
+          ? sl.wallRoofPts
+          : [{ s: sl.sMin, z: sl.zTop }, { s: sl.sMax, z: sl.zTop }];
+        const b0 = toS(sl.sMin, sl.zBase);
+        const b1 = toS(sl.sMax, sl.zBase);
+        const polyPts = [`${b0.x},${b0.y}`, `${b1.x},${b1.y}`, ...topPts.slice().reverse().map(pt => {
+          const sp = toS(pt.s, pt.z);
+          return `${sp.x},${sp.y}`;
+        })].join(' ');
+        parts.push(`<polygon points="${polyPts}" fill="${cat.color}" fill-opacity="0.25" stroke="${cat.color}" stroke-width="1.6"/>`);
+        const capPts = sl.roofCapPts || topPts;
+        if (sl.roof && (sl.roof.type !== 'flat' || sl.roof.overhang > 0.01) && capPts.length >= 2) {
+          const capStr = capPts.map(pt => { const sp = toS(pt.s, pt.z); return `${sp.x},${sp.y}`; }).join(' ');
+          parts.push(`<polyline points="${capStr}" fill="none" stroke="${this._darkenHex(cat.color, 0.7)}" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>`);
+        }
         const cx = (parseFloat(p1.x) + bw * 0.5).toFixed(1);
         const cy = (parseFloat(p1.y) + bh * 0.5).toFixed(1);
         parts.push(`<text x="${cx}" y="${cy}" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="600" fill="${pal.ink}">${this._esc((sl.vol.ref || sl.vol.id) + ' ' + sl.vol.short + ' (' + sl.dims.totalArea.toFixed(0) + 'm²)')}</text>`);
@@ -1322,6 +1425,16 @@
 
       parts.push('</svg>');
       return parts.join('\n');
+    }
+
+    _darkenHex(hex, factor = 0.7) {
+      const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+      if (!m) return hex;
+      const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
+      const r = clamp(parseInt(m[1], 16) * factor).toString(16).padStart(2, '0');
+      const g = clamp(parseInt(m[2], 16) * factor).toString(16).padStart(2, '0');
+      const b = clamp(parseInt(m[3], 16) * factor).toString(16).padStart(2, '0');
+      return `#${r}${g}${b}`;
     }
 
     _esc(str) {

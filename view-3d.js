@@ -266,7 +266,8 @@
           color: 0x7e9478,
           roughness: 0.9,
           transparent: true,
-          opacity: 0.52,
+          opacity: 0.48,
+          depthWrite: false,
           clippingPlanes: this.activeClipPlanes
         });
         const inst = new THREE.InstancedMesh(crownGeom, crownMat, trees.length);
@@ -433,7 +434,8 @@
 
         const meshes = [];
         for (const grp of this.volumeGroups.values()) {
-          if (grp.userData.boxMesh) meshes.push(grp.userData.boxMesh);
+          if (grp.userData.pickMeshes) meshes.push(...grp.userData.pickMeshes);
+          else if (grp.userData.boxMesh) meshes.push(grp.userData.boxMesh);
         }
         const hits = this.raycaster.intersectObjects(meshes, false);
         if (hits.length > 0) {
@@ -455,7 +457,8 @@
 
       const targets = [this.terrainMesh];
       for (const grp of this.volumeGroups.values()) {
-        if (grp.userData.boxMesh) targets.push(grp.userData.boxMesh);
+        if (grp.userData.pickMeshes) targets.push(...grp.userData.pickMeshes);
+        else if (grp.userData.boxMesh) targets.push(grp.userData.boxMesh);
       }
       const hits = this.raycaster.intersectObjects(targets, false);
       if (hits.length === 0) return null;
@@ -519,11 +522,12 @@
       for (const vol of state.volumes) {
         seenIds.add(vol.id);
         const dims = eng.getEffectiveDims(vol, state.useGross);
+        const roof = eng.getRoofSpec(vol);
         const cat = prog.getSpaceStyle(vol);
         const isSelected = state.selectedIds.includes(vol.id);
 
         let grp = this.volumeGroups.get(vol.id);
-        const sig = `${dims.w.toFixed(3)}|${dims.d.toFixed(3)}|${dims.totalHeight.toFixed(3)}|${dims.floors}|${cat.color}`;
+        const sig = `${dims.w.toFixed(3)}|${dims.d.toFixed(3)}|${dims.totalHeight.toFixed(3)}|${dims.floors}|${cat.color}|${roof.type}|${roof.angle}|${roof.dir}|${roof.overhang.toFixed(2)}`;
         if (!grp) {
           grp = new THREE.Group();
           grp.userData.volId = vol.id;
@@ -553,6 +557,7 @@
           boxMesh.userData.volId = vol.id;
           grp.add(boxMesh);
           grp.userData.boxMesh = boxMesh;
+          grp.userData.pickMeshes = [boxMesh];
 
           const selEdgeColor = isDark ? 0xf2eee6 : 0x11100e;
           const normEdgeColor = isDark ? 0xc5bfb2 : 0x3b3832;
@@ -562,6 +567,21 @@
           });
           const edges = new THREE.LineSegments(new THREE.EdgesGeometry(boxGeom), edgeMat);
           grp.add(edges);
+
+          if (roof.type !== 'flat' || roof.overhang > 0.01) {
+            const roofColor = new THREE.Color(cat.color).multiplyScalar(isDark ? 0.82 : 0.72);
+            const roofMat = new THREE.MeshStandardMaterial({
+              color: roofColor,
+              roughness: 0.78,
+              metalness: 0.05,
+              transparent: true,
+              opacity: isSelected ? 0.94 : 0.86,
+              clippingPlanes: this.activeClipPlanes
+            });
+            const roofBuilt = this._buildRoofMeshes(vol.id, dims, roof, boxMat, roofMat, edgeMat);
+            for (const obj of roofBuilt.objects) grp.add(obj);
+            grp.userData.pickMeshes.push(...roofBuilt.pickMeshes);
+          }
 
           // Subtle floor plate divider lines when multi-floor
           if (dims.floors > 1) {
@@ -823,7 +843,9 @@
         const el = this.labelEls.get(vol.id);
         if (!el) continue;
         const dims = eng.getEffectiveDims(vol, state.useGross);
-        tmp.set(vol.x, vol.zBase + dims.totalHeight + 0.55 - this.zDatum, -vol.y);
+        const roof = eng.getRoofSpec(vol);
+        const apexRise = eng.getRoofApexRise(dims, roof);
+        tmp.set(vol.x, vol.zBase + dims.totalHeight + apexRise + 0.55 - this.zDatum, -vol.y);
 
         // Hide if clipped away by active clipping plane
         if (plane && plane.enabled && this.clipPlane.distanceToPoint(tmp) < -0.5) {
@@ -880,6 +902,167 @@
     captureImageDataURL() {
       this.renderer.render(this.scene, this.camera);
       return this.renderer.domElement.toDataURL('image/png');
+    }
+
+    _buildRoofMeshes(volId, dims, roof, boxMat, roofMat, edgeMat) {
+      const eng = window.GROUNDWORK_ENGINE;
+      const hw = dims.w * 0.5;
+      const hd = dims.d * 0.5;
+      const ov = roof.overhang || 0;
+      const ehw = hw + ov;
+      const ehd = hd + ov;
+      const yEave = dims.totalHeight * 0.5;
+      const thick = 0.16;
+
+      const riseAt = (lx, ly) => eng.getRoofRiseAtLocal(lx, ly, dims.w, dims.d, roof);
+      const pt = (lx, ly, extraY = 0) => [lx, yEave + riseAt(lx, ly) + extraY, -ly];
+      const basePt = (lx, ly) => [lx, yEave, -ly];
+
+      const pushTri = (arr, a, b, c, ox, oy, oz) => {
+        const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+        const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+        const nx = uy * vz - uz * vy;
+        const ny = uz * vx - ux * vz;
+        const nz = ux * vy - uy * vx;
+        if (nx * ox + ny * oy + nz * oz >= 0) {
+          arr.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]);
+        } else {
+          arr.push(a[0], a[1], a[2], c[0], c[1], c[2], b[0], b[1], b[2]);
+        }
+      };
+      const pushQuad = (arr, a, b, c, d, ox, oy, oz) => {
+        pushTri(arr, a, b, c, ox, oy, oz);
+        pushTri(arr, a, c, d, ox, oy, oz);
+      };
+
+      const objects = [];
+      const pickMeshes = [];
+
+      // 1. Under-roof wall infill (gable ends / skillion high wall & cheeks)
+      const underPos = [];
+      if (roof.type === 'skillion') {
+        const ring = [[-hw, -hd, 0, 1], [hw, -hd, 1, 0], [hw, hd, 0, -1], [-hw, hd, -1, 0]];
+        for (let i = 0; i < 4; i++) {
+          const [ax, ay, ox, oz] = ring[i];
+          const [bx, by] = ring[(i + 1) % 4];
+          const ha = riseAt(ax, ay), hb = riseAt(bx, by);
+          if (ha > 0.005 || hb > 0.005) {
+            pushQuad(underPos, basePt(ax, ay), basePt(bx, by), pt(bx, by), pt(ax, ay), ox, 0, oz);
+          }
+        }
+        pushQuad(underPos, pt(-hw, -hd), pt(hw, -hd), pt(hw, hd), pt(-hw, hd), 0, 1, 0);
+      } else if (roof.type === 'gable') {
+        if (roof.dir === 0 || roof.dir === 180) {
+          pushTri(underPos, basePt(-hw, -hd), basePt(-hw, hd), pt(-hw, 0), -1, 0, 0);
+          pushTri(underPos, basePt(hw, -hd), basePt(hw, hd), pt(hw, 0), 1, 0, 0);
+          pushQuad(underPos, pt(-hw, -hd), pt(hw, -hd), pt(hw, 0), pt(-hw, 0), 0, 1, 0);
+          pushQuad(underPos, pt(-hw, 0), pt(hw, 0), pt(hw, hd), pt(-hw, hd), 0, 1, 0);
+        } else {
+          pushTri(underPos, basePt(-hw, -hd), basePt(hw, -hd), pt(0, -hd), 0, 0, 1);
+          pushTri(underPos, basePt(-hw, hd), basePt(hw, hd), pt(0, hd), 0, 0, -1);
+          pushQuad(underPos, pt(-hw, -hd), pt(0, -hd), pt(0, hd), pt(-hw, hd), 0, 1, 0);
+          pushQuad(underPos, pt(0, -hd), pt(hw, -hd), pt(hw, hd), pt(0, hd), 0, 1, 0);
+        }
+      }
+
+      if (underPos.length > 0) {
+        const uGeom = new THREE.BufferGeometry();
+        uGeom.setAttribute('position', new THREE.Float32BufferAttribute(underPos, 3));
+        uGeom.computeVertexNormals();
+        const uMesh = new THREE.Mesh(uGeom, boxMat);
+        uMesh.castShadow = true;
+        uMesh.receiveShadow = true;
+        uMesh.userData.volId = volId;
+        objects.push(uMesh);
+        pickMeshes.push(uMesh);
+        objects.push(new THREE.LineSegments(new THREE.EdgesGeometry(uGeom, 14), edgeMat));
+      }
+
+      // 2. Overhanging roof cap slab
+      const capPos = [];
+      const addCapQuad = (c0, c1, c2, c3) => {
+        pushQuad(capPos, pt(c0[0], c0[1], thick), pt(c1[0], c1[1], thick), pt(c2[0], c2[1], thick), pt(c3[0], c3[1], thick), 0, 1, 0);
+        pushQuad(capPos, pt(c0[0], c0[1], 0), pt(c1[0], c1[1], 0), pt(c2[0], c2[1], 0), pt(c3[0], c3[1], 0), 0, -1, 0);
+      };
+      const addCapTri = (c0, c1, c2) => {
+        pushTri(capPos, pt(c0[0], c0[1], thick), pt(c1[0], c1[1], thick), pt(c2[0], c2[1], thick), 0, 1, 0);
+        pushTri(capPos, pt(c0[0], c0[1], 0), pt(c1[0], c1[1], 0), pt(c2[0], c2[1], 0), 0, -1, 0);
+      };
+      const addFasciaSeg = (ax, ay, bx, by, ox, oz) => {
+        pushQuad(capPos, pt(ax, ay, 0), pt(bx, by, 0), pt(bx, by, thick), pt(ax, ay, thick), ox, 0, oz);
+      };
+
+      if (roof.type === 'flat' || roof.type === 'skillion') {
+        addCapQuad([-ehw, -ehd], [ehw, -ehd], [ehw, ehd], [-ehw, ehd]);
+        addFasciaSeg(-ehw, -ehd, ehw, -ehd, 0, 1);
+        addFasciaSeg(ehw, -ehd, ehw, ehd, 1, 0);
+        addFasciaSeg(ehw, ehd, -ehw, ehd, 0, -1);
+        addFasciaSeg(-ehw, ehd, -ehw, -ehd, -1, 0);
+      } else if (roof.type === 'gable') {
+        if (roof.dir === 0 || roof.dir === 180) {
+          addCapQuad([-ehw, -ehd], [ehw, -ehd], [ehw, 0], [-ehw, 0]);
+          addCapQuad([-ehw, 0], [ehw, 0], [ehw, ehd], [-ehw, ehd]);
+          addFasciaSeg(-ehw, -ehd, ehw, -ehd, 0, 1);
+          addFasciaSeg(ehw, ehd, -ehw, ehd, 0, -1);
+          addFasciaSeg(ehw, -ehd, ehw, 0, 1, 0);
+          addFasciaSeg(ehw, 0, ehw, ehd, 1, 0);
+          addFasciaSeg(-ehw, ehd, -ehw, 0, -1, 0);
+          addFasciaSeg(-ehw, 0, -ehw, -ehd, -1, 0);
+        } else {
+          addCapQuad([-ehw, -ehd], [0, -ehd], [0, ehd], [-ehw, ehd]);
+          addCapQuad([0, -ehd], [ehw, -ehd], [ehw, ehd], [0, ehd]);
+          addFasciaSeg(ehw, -ehd, ehw, ehd, 1, 0);
+          addFasciaSeg(-ehw, ehd, -ehw, -ehd, -1, 0);
+          addFasciaSeg(-ehw, -ehd, 0, -ehd, 0, 1);
+          addFasciaSeg(0, -ehd, ehw, -ehd, 0, 1);
+          addFasciaSeg(ehw, ehd, 0, ehd, 0, -1);
+          addFasciaSeg(0, ehd, -ehw, ehd, 0, -1);
+        }
+      } else {
+        // hip (note ehw - ehd === hw - hd)
+        if (hw >= hd) {
+          const rx = hw - hd;
+          if (rx > 0.02) {
+            addCapQuad([-ehw, -ehd], [ehw, -ehd], [rx, 0], [-rx, 0]);
+            addCapQuad([-rx, 0], [rx, 0], [ehw, ehd], [-ehw, ehd]);
+          } else {
+            addCapTri([-ehw, -ehd], [ehw, -ehd], [0, 0]);
+            addCapTri([-ehw, ehd], [ehw, ehd], [0, 0]);
+          }
+          addCapTri([-ehw, -ehd], [-ehw, ehd], [-rx, 0]);
+          addCapTri([ehw, -ehd], [ehw, ehd], [rx, 0]);
+        } else {
+          const ry = hd - hw;
+          if (ry > 0.02) {
+            addCapQuad([-ehw, -ehd], [0, -ry], [0, ry], [-ehw, ehd]);
+            addCapQuad([0, -ry], [ehw, -ehd], [ehw, ehd], [0, ry]);
+          } else {
+            addCapTri([-ehw, -ehd], [-ehw, ehd], [0, 0]);
+            addCapTri([ehw, -ehd], [ehw, ehd], [0, 0]);
+          }
+          addCapTri([-ehw, -ehd], [ehw, -ehd], [0, -ry]);
+          addCapTri([-ehw, ehd], [ehw, ehd], [0, ry]);
+        }
+        addFasciaSeg(-ehw, -ehd, ehw, -ehd, 0, 1);
+        addFasciaSeg(ehw, -ehd, ehw, ehd, 1, 0);
+        addFasciaSeg(ehw, ehd, -ehw, ehd, 0, -1);
+        addFasciaSeg(-ehw, ehd, -ehw, -ehd, -1, 0);
+      }
+
+      if (capPos.length > 0) {
+        const cGeom = new THREE.BufferGeometry();
+        cGeom.setAttribute('position', new THREE.Float32BufferAttribute(capPos, 3));
+        cGeom.computeVertexNormals();
+        const cMesh = new THREE.Mesh(cGeom, roofMat);
+        cMesh.castShadow = true;
+        cMesh.receiveShadow = true;
+        cMesh.userData.volId = volId;
+        objects.push(cMesh);
+        pickMeshes.push(cMesh);
+        objects.push(new THREE.LineSegments(new THREE.EdgesGeometry(cGeom, 12), edgeMat));
+      }
+
+      return { objects, pickMeshes };
     }
 
     _esc(str) {

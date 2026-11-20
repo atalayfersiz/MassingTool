@@ -1304,6 +1304,67 @@
         ctx.strokeRect(-pw * 0.5 + 3, -pd * 0.5 + 3, Math.max(0, pw - 6), Math.max(0, pd - 6));
       }
 
+      // Subtle architectural Plan roof lines & eave overhang
+      const roof = window.GROUNDWORK_ENGINE.getRoofSpec(vol);
+      if (roof.type !== 'flat' || roof.overhang > 0.05) {
+        const ovPx = roof.overhang * this.cam.pxPerM;
+        const epw = pw + ovPx * 2;
+        const epd = pd + ovPx * 2;
+        ctx.save();
+        ctx.strokeStyle = pal.ink;
+        ctx.fillStyle = pal.ink;
+        ctx.globalAlpha = 0.36;
+        ctx.lineWidth = 0.9;
+
+        if (ovPx > 1.2) {
+          ctx.setLineDash([3, 3]);
+          ctx.strokeRect(-epw * 0.5, -epd * 0.5, epw, epd);
+          ctx.setLineDash([]);
+        }
+        if (roof.type === 'gable') {
+          ctx.beginPath();
+          if (roof.dir === 0 || roof.dir === 180) {
+            ctx.moveTo(-epw * 0.5, 0); ctx.lineTo(epw * 0.5, 0);
+          } else {
+            ctx.moveTo(0, -epd * 0.5); ctx.lineTo(0, epd * 0.5);
+          }
+          ctx.stroke();
+        } else if (roof.type === 'hip') {
+          ctx.beginPath();
+          if (pw >= pd) {
+            const rx = Math.max(0, (pw - pd) * 0.5);
+            ctx.moveTo(-epw * 0.5, -epd * 0.5); ctx.lineTo(-rx, 0);
+            ctx.moveTo(-epw * 0.5, epd * 0.5); ctx.lineTo(-rx, 0);
+            ctx.moveTo(epw * 0.5, -epd * 0.5); ctx.lineTo(rx, 0);
+            ctx.moveTo(epw * 0.5, epd * 0.5); ctx.lineTo(rx, 0);
+            if (rx > 0.5) { ctx.moveTo(-rx, 0); ctx.lineTo(rx, 0); }
+          } else {
+            const ry = Math.max(0, (pd - pw) * 0.5);
+            ctx.moveTo(-epw * 0.5, -epd * 0.5); ctx.lineTo(0, -ry);
+            ctx.moveTo(epw * 0.5, -epd * 0.5); ctx.lineTo(0, -ry);
+            ctx.moveTo(-epw * 0.5, epd * 0.5); ctx.lineTo(0, ry);
+            ctx.moveTo(epw * 0.5, epd * 0.5); ctx.lineTo(0, ry);
+            if (ry > 0.5) { ctx.moveTo(0, -ry); ctx.lineTo(0, ry); }
+          }
+          ctx.stroke();
+        } else if (roof.type === 'skillion' && pw >= 22 && pd >= 18) {
+          // Small slope-down arrow placed near the low corner to keep label clear
+          const dirs = { 0: [0, -1], 90: [1, 0], 180: [0, 1], 270: [-1, 0] };
+          const [ux, uy] = dirs[roof.dir] || [0, -1];
+          const ax = ux * (pw * 0.5 - 10) + (ux === 0 ? pw * 0.5 - 10 : 0);
+          const ay = uy * (pd * 0.5 - 10) + (uy === 0 ? pd * 0.5 - 10 : 0);
+          const sx0 = ax - ux * 6, sy0 = ay - uy * 6;
+          const sx1 = ax + ux * 4, sy1 = ay + uy * 4;
+          const ang = Math.atan2(uy, ux);
+          ctx.beginPath();
+          ctx.moveTo(sx0, sy0); ctx.lineTo(sx1, sy1);
+          ctx.moveTo(sx1, sy1); ctx.lineTo(sx1 - Math.cos(ang - 0.55) * 4, sy1 - Math.sin(ang - 0.55) * 4);
+          ctx.moveTo(sx1, sy1); ctx.lineTo(sx1 - Math.cos(ang + 0.55) * 4, sy1 - Math.sin(ang + 0.55) * 4);
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+
       // Labels inside bubble (auto-fit cleanly)
       const areaStr = dims.floors > 1
         ? `${dims.totalArea.toFixed(0)} m² (${dims.floors}F · ${dims.footprintArea.toFixed(1)}/F)`
@@ -1878,6 +1939,29 @@
         const deg = -((vol.rot || 0) * 180 / Math.PI);
         parts.push(`<g transform="translate(${center.x},${center.y}) rotate(${deg.toFixed(2)})">`);
         parts.push(`<rect x="${(-pw / 2).toFixed(2)}" y="${(-pd / 2).toFixed(2)}" width="${pw.toFixed(2)}" height="${pd.toFixed(2)}" fill="${cat.color}" fill-opacity="0.30" stroke="${cat.color}" stroke-width="1.4"/>`);
+        const roof = eng.getRoofSpec(vol);
+        if (roof.type !== 'flat' || roof.overhang > 0.05) {
+          const ovPx = roof.overhang * this.cam.pxPerM;
+          const epw = pw + ovPx * 2, epd = pd + ovPx * 2;
+          if (ovPx > 1.2) {
+            parts.push(`<rect x="${(-epw / 2).toFixed(2)}" y="${(-epd / 2).toFixed(2)}" width="${epw.toFixed(2)}" height="${epd.toFixed(2)}" fill="none" stroke="${pal.ink}" stroke-opacity="0.35" stroke-width="0.9" stroke-dasharray="3 3"/>`);
+          }
+          if (roof.type === 'gable') {
+            if (roof.dir === 0 || roof.dir === 180) {
+              parts.push(`<line x1="${(-epw / 2).toFixed(2)}" y1="0" x2="${(epw / 2).toFixed(2)}" y2="0" stroke="${pal.ink}" stroke-opacity="0.35" stroke-width="0.9"/>`);
+            } else {
+              parts.push(`<line x1="0" y1="${(-epd / 2).toFixed(2)}" x2="0" y2="${(epd / 2).toFixed(2)}" stroke="${pal.ink}" stroke-opacity="0.35" stroke-width="0.9"/>`);
+            }
+          } else if (roof.type === 'hip') {
+            if (pw >= pd) {
+              const rx = Math.max(0, (pw - pd) * 0.5);
+              parts.push(`<path d="M${(-epw / 2).toFixed(2)},${(-epd / 2).toFixed(2)} L${(-rx).toFixed(2)},0 L${(-epw / 2).toFixed(2)},${(epd / 2).toFixed(2)} M${(epw / 2).toFixed(2)},${(-epd / 2).toFixed(2)} L${rx.toFixed(2)},0 L${(epw / 2).toFixed(2)},${(epd / 2).toFixed(2)} M${(-rx).toFixed(2)},0 L${rx.toFixed(2)},0" fill="none" stroke="${pal.ink}" stroke-opacity="0.35" stroke-width="0.9"/>`);
+            } else {
+              const ry = Math.max(0, (pd - pw) * 0.5);
+              parts.push(`<path d="M${(-epw / 2).toFixed(2)},${(-epd / 2).toFixed(2)} L0,${(-ry).toFixed(2)} L${(epw / 2).toFixed(2)},${(-epd / 2).toFixed(2)} M${(-epw / 2).toFixed(2)},${(epd / 2).toFixed(2)} L0,${ry.toFixed(2)} L${(epw / 2).toFixed(2)},${(epd / 2).toFixed(2)} M0,${(-ry).toFixed(2)} L0,${ry.toFixed(2)}" fill="none" stroke="${pal.ink}" stroke-opacity="0.35" stroke-width="0.9"/>`);
+            }
+          }
+        }
         parts.push(`<text x="0" y="-3" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="600" fill="${pal.ink}">${this._esc((vol.ref || vol.id) + ' ' + vol.short)}</text>`);
         parts.push(`<text x="0" y="11" text-anchor="middle" font-family="monospace" font-size="10" fill="${pal.inkSub}">${dims.totalArea.toFixed(0)} m²</text>`);
         if (state.layers.rectDims && this.cam.pxPerM >= 7.5 && pw >= 38 && pd >= 24) {

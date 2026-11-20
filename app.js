@@ -71,12 +71,17 @@
 
   function normalizeVolume(v) {
     const locked = prog.isAreaLocked(v);
+    const roof = eng.getRoofSpec(v);
     return {
       ...v,
       areaLocked: locked,
       freeResize: !locked,
       floors: Math.max(1, v.floors || 1),
-      floorHeight: v.floorHeight || prog.DEFAULT_FLOOR_HEIGHT
+      floorHeight: v.floorHeight || prog.DEFAULT_FLOOR_HEIGHT,
+      roofType: roof.type,
+      roofAngle: roof.angle,
+      roofDir: roof.dir,
+      roofOverhang: roof.overhang
     };
   }
 
@@ -232,6 +237,7 @@
     const d = fpArea / w;
     const gz = eng.getGroundZ(x, y);
     const locked = prog.isAreaLocked(space);
+    const roof = eng.getRoofSpec(space);
     return {
       id: space.id,
       ref: space.ref,
@@ -248,6 +254,10 @@
       d,
       floors,
       floorHeight: space.floorHeight || prog.DEFAULT_FLOOR_HEIGHT,
+      roofType: roof.type,
+      roofAngle: roof.angle,
+      roofDir: roof.dir,
+      roofOverhang: roof.overhang,
       rot: 0,
       x,
       y,
@@ -312,10 +322,14 @@
     tpl.freeResize = vol.freeResize;
     tpl.floors = vol.floors;
     tpl.floorHeight = vol.floorHeight;
+    tpl.roofType = vol.roofType;
+    tpl.roofAngle = vol.roofAngle;
+    tpl.roofDir = vol.roofDir;
+    tpl.roofOverhang = vol.roofOverhang;
     tpl.keywords = (vol.keywords || []).slice();
   }
 
-  function createCustomBubble({ name, ref, note, customColor, area, areaLocked, floors, floorHeight }) {
+  function createCustomBubble({ name, ref, note, customColor, area, areaLocked, floors, floorHeight, roofType }) {
     pushUndo();
     const num = state.nextCustomNum++;
     const cleanName = (name || '').trim() || `Custom Space ${num}`;
@@ -325,6 +339,7 @@
     const cleanFloors = Math.max(1, Math.min(6, Math.round(parseFloat(floors) || 1)));
     const cleanFH = Math.max(1.5, Math.min(14, parseFloat(floorHeight) || prog.DEFAULT_FLOOR_HEIGHT));
     const locked = areaLocked !== false;
+    const cleanRoof = ['flat', 'skillion', 'gable', 'hip'].includes(roofType) ? roofType : 'flat';
     const id = 'custom-' + Date.now() + '-' + num;
 
     const tpl = {
@@ -341,6 +356,10 @@
       freeResize: !locked,
       floors: cleanFloors,
       floorHeight: cleanFH,
+      roofType: cleanRoof,
+      roofAngle: 22,
+      roofDir: 0,
+      roofOverhang: cleanRoof === 'flat' ? 0 : 0.5,
       excludeFromNetTotal: false,
       keywords: [],
       links: [],
@@ -1213,6 +1232,19 @@
               <button class="btn" id="sbApplyBatchHeight">Apply</button>
             </div>
           </div>
+          <div class="field">
+            <label>Set Roof for All</label>
+            <div class="row-between">
+              <select id="sbBatchRoofType" style="flex:1;padding:4px;border:1px solid var(--border);border-radius:4px;background:var(--surface);">
+                <option value="flat">Flat</option>
+                <option value="skillion" selected>Skillion</option>
+                <option value="gable">Gable</option>
+                <option value="hip">Hip</option>
+              </select>
+              <input type="number" id="sbBatchRoofAngle" step="1" min="5" max="55" value="22" style="width:54px;" title="Pitch Angle (°)" />
+              <button class="btn" id="sbApplyBatchRoof">Apply</button>
+            </div>
+          </div>
           <div class="row-between">
             <button class="btn" id="sbBatchSnapZ" style="flex:1">Snap All Z to Ground</button>
             <button class="btn danger" id="sbBatchRemove">Remove</button>
@@ -1224,6 +1256,16 @@
       document.getElementById('sbApplyBatchHeight').addEventListener('click', () => {
         const val = Math.max(1.5, parseFloat(document.getElementById('sbBatchHeight').value) || 3.0);
         updateVolumesBatch(selVols.map(v => ({ id: v.id, floorHeight: val })));
+      });
+      document.getElementById('sbApplyBatchRoof').addEventListener('click', () => {
+        const rt = document.getElementById('sbBatchRoofType').value;
+        const ang = Math.max(5, Math.min(55, parseFloat(document.getElementById('sbBatchRoofAngle').value) || 22));
+        updateVolumesBatch(selVols.map(v => ({
+          id: v.id,
+          roofType: rt,
+          roofAngle: ang,
+          roofOverhang: rt === 'flat' ? 0 : (v.roofOverhang > 0 ? v.roofOverhang : 0.5)
+        })));
       });
       document.getElementById('sbBatchSnapZ').addEventListener('click', () => {
         updateVolumesBatch(selVols.map(v => ({ id: v.id, zBase: Math.round(eng.getGroundZ(v.x, v.y) * 100) / 100 })));
@@ -1313,6 +1355,118 @@
       </div>
     `;
     body.appendChild(sec);
+
+    // Roof Panel (Flat / Skillion / Gable / Hip + Pitch Angle / Direction / Overhang)
+    const roof = eng.getRoofSpec(vol);
+    const roofApex = eng.getRoofApexRise(dims, roof);
+    const roofPanel = document.createElement('div');
+    roofPanel.className = 'panel-section';
+    const roofTypes = [['flat', 'Flat'], ['skillion', 'Skillion'], ['gable', 'Gable'], ['hip', 'Hip']];
+    const typeBtnsHtml = roofTypes.map(([k, lbl]) =>
+      `<button type="button" class="seg-btn ${roof.type === k ? 'active' : ''}" data-rooftype="${k}" style="flex:1;">${lbl}</button>`
+    ).join('');
+
+    let dirControlsHtml = '';
+    if (roof.type === 'skillion') {
+      const dirs = [[0, 'Back'], [90, 'Right'], [180, 'Front'], [270, 'Left']];
+      dirControlsHtml = `
+        <div class="field">
+          <label>Slope Down</label>
+          <div class="segmented" style="display:flex;">
+            ${dirs.map(([dVal, lbl]) => `<button type="button" class="seg-btn ${roof.dir === dVal ? 'active' : ''}" data-roofdir="${dVal}" style="flex:1;">${lbl}</button>`).join('')}
+          </div>
+        </div>
+      `;
+    } else if (roof.type === 'gable') {
+      const axis0 = roof.dir === 0 || roof.dir === 180;
+      dirControlsHtml = `
+        <div class="field">
+          <label>Ridge Direction</label>
+          <div class="segmented" style="display:flex;">
+            <button type="button" class="seg-btn ${axis0 ? 'active' : ''}" data-roofdir="0" style="flex:1;">Along W</button>
+            <button type="button" class="seg-btn ${!axis0 ? 'active' : ''}" data-roofdir="90" style="flex:1;">Along D</button>
+          </div>
+        </div>
+      `;
+    }
+
+    const pitchControlsHtml = roof.type !== 'flat' ? `
+      <div class="field-grid">
+        <div class="field">
+          <label>Pitch Angle (°)</label>
+          <input type="number" id="inRoofAngle" step="1" min="5" max="55" value="${Math.round(roof.angle)}" />
+        </div>
+        <div class="field">
+          <label>Overhang (m)</label>
+          <input type="number" id="inRoofOverhang" step="0.1" min="0" max="2.5" value="${roof.overhang.toFixed(1)}" />
+        </div>
+      </div>
+      <div class="field">
+        <div class="row-between">
+          <label>Slope Pitch</label>
+          <span style="font-size:10.5px;font-family:var(--mono);color:var(--ink-muted);" id="roofRiseVal">Rise +${roofApex.toFixed(1)} m</span>
+        </div>
+        <input type="range" id="rngRoofAngle" min="5" max="55" step="1" value="${Math.round(roof.angle)}" />
+      </div>
+      ${dirControlsHtml}
+    ` : `
+      <div class="field">
+        <label>Eave Overhang (m)</label>
+        <input type="number" id="inRoofOverhang" step="0.1" min="0" max="2.5" value="${roof.overhang.toFixed(1)}" />
+      </div>
+    `;
+
+    roofPanel.innerHTML = `
+      <div class="panel-title">
+        <span>Roof Type</span>
+        <span>${roof.type === 'flat' ? 'Flat' : `${Math.round(roof.angle)}° (+${roofApex.toFixed(1)}m)`}</span>
+      </div>
+      <div class="segmented" style="display:flex;">${typeBtnsHtml}</div>
+      ${pitchControlsHtml}
+    `;
+    body.appendChild(roofPanel);
+
+    roofPanel.querySelectorAll('[data-rooftype]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const rt = btn.dataset.rooftype;
+        const nextOv = (rt !== 'flat' && roof.type === 'flat' && roof.overhang === 0)
+          ? 0.5
+          : (rt === 'flat' ? 0 : roof.overhang);
+        updateVolume(vol.id, { roofType: rt, roofAngle: roof.angle, roofOverhang: nextOv }, { forceSidebar: true });
+      });
+    });
+    roofPanel.querySelectorAll('[data-roofdir]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        updateVolume(vol.id, { roofDir: parseInt(btn.dataset.roofdir, 10) || 0 }, { forceSidebar: true });
+      });
+    });
+    const inRoofAng = document.getElementById('inRoofAngle');
+    if (inRoofAng) {
+      inRoofAng.addEventListener('change', (e) => {
+        const ang = Math.max(5, Math.min(55, parseFloat(e.target.value) || 22));
+        updateVolume(vol.id, { roofAngle: ang }, { forceSidebar: true });
+      });
+    }
+    const rngRoofAng = document.getElementById('rngRoofAngle');
+    if (rngRoofAng) {
+      let roofAngUndo = false;
+      rngRoofAng.addEventListener('input', (e) => {
+        if (!roofAngUndo) { pushUndo(); roofAngUndo = true; }
+        const ang = Math.max(5, Math.min(55, parseFloat(e.target.value) || 22));
+        if (inRoofAng) inRoofAng.value = ang;
+        const riseEl = document.getElementById('roofRiseVal');
+        if (riseEl) riseEl.textContent = `Rise +${eng.getRoofApexRise(dims, { ...roof, angle: ang }).toFixed(1)} m`;
+        updateVolume(vol.id, { roofAngle: ang }, { silentUndo: true });
+      });
+      rngRoofAng.addEventListener('change', () => refreshAll({ forceSidebar: true }));
+    }
+    const inRoofOv = document.getElementById('inRoofOverhang');
+    if (inRoofOv) {
+      inRoofOv.addEventListener('change', (e) => {
+        const ov = Math.max(0, Math.min(2.5, parseFloat(e.target.value) || 0));
+        updateVolume(vol.id, { roofOverhang: ov }, { forceSidebar: true });
+      });
+    }
 
     // Earthwork Panel
     const ewPanel = document.createElement('div');
@@ -2001,6 +2155,8 @@
     document.getElementById('cbAreaLocked').checked = true;
     document.getElementById('cbFloors').value = '1';
     document.getElementById('cbFloorH').value = String(prog.DEFAULT_FLOOR_HEIGHT);
+    const cbRoofSel = document.getElementById('cbRoofType');
+    if (cbRoofSel) cbRoofSel.value = 'flat';
     syncCbSwatches(prog.CUSTOM_SWATCHES[(state.nextCustomNum - 1) % prog.CUSTOM_SWATCHES.length]);
     customBubbleModal.classList.add('open');
     setTimeout(() => document.getElementById('cbName').focus(), 20);
@@ -2023,8 +2179,9 @@
     const areaLocked = document.getElementById('cbAreaLocked').checked;
     const floors = parseInt(document.getElementById('cbFloors').value, 10) || 1;
     const floorHeight = parseFloat(document.getElementById('cbFloorH').value) || prog.DEFAULT_FLOOR_HEIGHT;
+    const roofType = document.getElementById('cbRoofType') ? document.getElementById('cbRoofType').value : 'flat';
     closeCustomBubbleModal();
-    createCustomBubble({ name, ref, note, customColor, area, areaLocked, floors, floorHeight });
+    createCustomBubble({ name, ref, note, customColor, area, areaLocked, floors, floorHeight, roofType });
   });
 
   document.getElementById('btnExportMenu').addEventListener('click', openProjectModal);
