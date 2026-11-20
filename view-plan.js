@@ -14,8 +14,13 @@
       };
 
       this.hoverId = null;
+      this.hoverItem = null;
       this.dragState = null;
       this.dimDraft = null;
+      this.lineDraft = null;
+      this.dimHitBoxes = [];
+      this.sectionTextBoxes = [];
+      this.annHitBoxes = [];
       this.marquee = null;
       this.spaceHeld = false;
       this.cursorWorld = null;
@@ -60,7 +65,8 @@
 
     _bindEvents() {
       window.addEventListener('keydown', (e) => {
-        if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT') {
+        const tag = document.activeElement ? document.activeElement.tagName : '';
+        if (e.code === 'Space' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(tag)) {
           this.spaceHeld = true;
         }
       });
@@ -81,6 +87,22 @@
         this.cam.cy += before.y - after.y;
         this.render();
       }, { passive: false });
+
+      this.canvas.addEventListener('dblclick', (e) => {
+        const pos = this._getPointerPos(e);
+        const state = this.api.getState();
+        if (!state.layers.annotations) return;
+        const annHit = this._hitTestAnnotations(pos.x, pos.y);
+        if (annHit && annHit.kind === 'text') {
+          this.api.openInlineTextEditor({
+            view: 'plan',
+            clientX: e.clientX,
+            clientY: e.clientY,
+            existingId: annHit.ann.id,
+            initialText: annHit.ann.text
+          });
+        }
+      });
 
       this.canvas.addEventListener('pointerdown', (e) => {
         const pos = this._getPointerPos(e);
@@ -109,37 +131,118 @@
           if (!this.dimDraft) {
             this.dimDraft = { p1: pt, p2: pt };
           } else {
-            this.api.addDimension('plan', this.dimDraft.p1, pt);
+            const dim = this.api.addDimension('plan', this.dimDraft.p1, pt);
             this.dimDraft = null;
+            if (dim) this.api.selectItem('dim', dim.id);
           }
           this.render();
           return;
         }
 
-        // Section plane tool OR grabbing active section plane handles
-        const secHit = this._hitTestSectionPlane(pos.x, pos.y);
-        if (state.tool === 'section' || secHit) {
-          if (secHit) {
+        // Line / Arrow annotation tool (supports click-drag OR click-click)
+        if (state.tool === 'line') {
+          if (!this.lineDraft) {
+            this.lineDraft = {
+              p1: { x: world.x, y: world.y },
+              p2: { x: world.x, y: world.y },
+              startPos: pos,
+              moved: false
+            };
+            this.dragState = { type: 'line-draw' };
+            this.canvas.setPointerCapture(e.pointerId);
+          } else {
+            const p2 = this._snapAnglePoint(this.lineDraft.p1, world, e.shiftKey);
+            if (Math.hypot(p2.x - this.lineDraft.p1.x, p2.y - this.lineDraft.p1.y) > 0.25) {
+              this.api.addAnnotation({
+                type: 'line',
+                view: 'plan',
+                p1: { ...this.lineDraft.p1 },
+                p2,
+                startCap: 'none',
+                endCap: 'arrow',
+                dashed: false,
+                strokeWidth: 1.5,
+                color: 'ink'
+              });
+            }
+            this.lineDraft = null;
+          }
+          this.render();
+          return;
+        }
+
+        // Text annotation tool
+        if (state.tool === 'text') {
+          this.api.openInlineTextEditor({
+            view: 'plan',
+            clientX: e.clientX,
+            clientY: e.clientY,
+            worldPos: { x: world.x, y: world.y }
+          });
+          return;
+        }
+
+        // Section plane tool: active handle drag or draw new line
+        if (state.tool === 'section') {
+          const secHandle = this._hitTestSectionHandles(pos.x, pos.y, true);
+          if (secHandle) {
             this.dragState = {
-              type: secHit === 'center' ? 'sec-move' : 'sec-rotate',
-              handle: secHit,
+              type: secHandle === 'center' || secHandle === 'body' ? 'sec-move' : 'sec-rotate',
+              handle: secHandle,
               startWorld: world,
               origPlane: { ...this.api.getActivePlane() }
             };
             this.canvas.setPointerCapture(e.pointerId);
             return;
           }
-          if (state.tool === 'section') {
+          this.dragState = { type: 'sec-draw', p1: world };
+          this.canvas.setPointerCapture(e.pointerId);
+          return;
+        }
+
+        // 1. Selected dimension endpoints (p1 / p2)
+        const dimEpHit = this._hitTestSelectedDimEndpoint(pos.x, pos.y);
+        if (dimEpHit) {
+          this.api.pushUndo();
+          this.dragState = {
+            type: 'dim-endpoint',
+            dimId: dimEpHit.dim.id,
+            endpoint: dimEpHit.endpoint
+          };
+          this.canvas.setPointerCapture(e.pointerId);
+          return;
+        }
+
+        // 2. Selected line annotation endpoints (p1 / p2)
+        const lineEpHit = this._hitTestSelectedLineEndpoint(pos.x, pos.y);
+        if (lineEpHit) {
+          this.api.pushUndo();
+          this.dragState = {
+            type: 'line-endpoint',
+            annId: lineEpHit.ann.id,
+            endpoint: lineEpHit.endpoint
+          };
+          this.canvas.setPointerCapture(e.pointerId);
+          return;
+        }
+
+        // 3. Active section plane handles (ONLY when section is already selected!)
+        if (this._isSectionActive(state)) {
+          const secHandle = this._hitTestSectionHandles(pos.x, pos.y, true);
+          if (secHandle) {
+            this.api.pushUndo();
             this.dragState = {
-              type: 'sec-draw',
-              p1: world
+              type: (secHandle === 'center' || secHandle === 'body') ? 'sec-move' : 'sec-rotate',
+              handle: secHandle,
+              startWorld: world,
+              origPlane: { ...this.api.getActivePlane() }
             };
             this.canvas.setPointerCapture(e.pointerId);
             return;
           }
         }
 
-        // Check resize/rotate handles on primary selected space
+        // 4. Resize/rotate handles on currently selected space (always grabbable when visible)
         const handleHit = this._hitTestHandles(pos.x, pos.y);
         if (handleHit) {
           const vol = this.api.getVolume(handleHit.id);
@@ -156,14 +259,72 @@
           }
         }
 
-        // Check space bubble hit (topmost zOrder first)
+        // 5. Dimension text box -> select & allow drag to move whole dimension
+        const dimBoxHit = this._hitTestDimTextBox(pos.x, pos.y);
+        if (dimBoxHit) {
+          const dim = state.dimensions.find(d => d.id === dimBoxHit.id);
+          if (dim) {
+            this.api.selectItem('dim', dim.id);
+            this.api.pushUndo();
+            this.dragState = {
+              type: 'dim-move',
+              dimId: dim.id,
+              startWorld: world,
+              origP1: { ...dim.p1 },
+              origP2: { ...dim.p2 }
+            };
+            this.canvas.setPointerCapture(e.pointerId);
+            this.render();
+            return;
+          }
+        }
+
+        // 6. Annotations (Text & Line/Arrow) when visible
+        if (state.layers.annotations) {
+          const annHit = this._hitTestAnnotations(pos.x, pos.y);
+          if (annHit) {
+            const ann = annHit.ann;
+            this.api.selectItem(ann.type, ann.id);
+            this.api.pushUndo();
+            this.dragState = {
+              type: 'ann-move',
+              annId: ann.id,
+              kind: ann.type,
+              startWorld: world,
+              orig: ann.type === 'text'
+                ? { x: ann.x, y: ann.y }
+                : { p1: { ...ann.p1 }, p2: { ...ann.p2 } }
+            };
+            this.canvas.setPointerCapture(e.pointerId);
+            this.render();
+            return;
+          }
+        }
+
+        // 7. Unselected section plane clickable ONLY from its text box
+        const secBoxHit = this._hitTestSectionTextBoxes(pos.x, pos.y);
+        if (secBoxHit) {
+          const plane = this.api.getActivePlane();
+          this.api.selectItem('section', plane ? plane.id : secBoxHit.planeId);
+          this.dragState = {
+            type: (secBoxHit.handle === 'a' || secBoxHit.handle === 'b') ? 'sec-rotate' : 'sec-move',
+            handle: secBoxHit.handle,
+            startPos: pos,
+            startWorld: world,
+            origPlane: { ...this.api.getActivePlane() }
+          };
+          this.canvas.setPointerCapture(e.pointerId);
+          this.render();
+          return;
+        }
+
+        // 8. Space bubble hit (topmost zOrder first)
         const hitVol = this._hitTestVolume(world.x, world.y);
         if (hitVol) {
           const alreadySelected = state.selectedIds.includes(hitVol.id);
           if (e.shiftKey) {
             this.api.toggleSelect(hitVol.id);
           } else if (!alreadySelected) {
-            // Select group if part of group (unless double-clicked)
             this.api.selectVolume(hitVol.id, e.detail < 2);
           }
           const dragIds = this.api.getState().selectedIds.slice();
@@ -192,7 +353,7 @@
           return;
         }
 
-        // Empty canvas -> marquee select
+        // 9. Empty canvas -> clear selection + marquee select
         if (!e.shiftKey) {
           this.api.clearSelection();
         }
@@ -223,6 +384,11 @@
             this.render();
             return;
           }
+          if (state.tool === 'line' && this.lineDraft) {
+            this.lineDraft.p2 = this._snapAnglePoint(this.lineDraft.p1, world, e.shiftKey);
+            this.render();
+            return;
+          }
           const hit = this._hitTestVolume(world.x, world.y);
           const nextHover = hit ? hit.id : null;
           if (nextHover !== this.hoverId) {
@@ -239,6 +405,67 @@
           this.cam.cx = this.dragState.origCx - dx;
           this.cam.cy = this.dragState.origCy + dy;
           this.render();
+          return;
+        }
+
+        if (this.dragState.type === 'line-draw' && this.lineDraft) {
+          if (Math.hypot(pos.x - this.lineDraft.startPos.x, pos.y - this.lineDraft.startPos.y) > 4) {
+            this.lineDraft.moved = true;
+          }
+          this.lineDraft.p2 = this._snapAnglePoint(this.lineDraft.p1, world, e.shiftKey);
+          this.render();
+          return;
+        }
+
+        if (this.dragState.type === 'dim-endpoint') {
+          const dim = state.dimensions.find(d => d.id === this.dragState.dimId);
+          if (!dim) return;
+          const otherPt = this.dragState.endpoint === 'p1' ? dim.p2 : dim.p1;
+          const snapped = this._snapAnglePoint(otherPt, world, e.shiftKey);
+          const nz = window.GROUNDWORK_ENGINE.getGroundZ(snapped.x, snapped.y);
+          this.api.updateDimension(dim.id, {
+            [this.dragState.endpoint]: { x: snapped.x, y: snapped.y, z: nz }
+          }, { silentUndo: true });
+          return;
+        }
+
+        if (this.dragState.type === 'dim-move') {
+          const dx = world.x - this.dragState.startWorld.x;
+          const dy = world.y - this.dragState.startWorld.y;
+          const p1x = this.dragState.origP1.x + dx;
+          const p1y = this.dragState.origP1.y + dy;
+          const p2x = this.dragState.origP2.x + dx;
+          const p2y = this.dragState.origP2.y + dy;
+          this.api.updateDimension(this.dragState.dimId, {
+            p1: { x: p1x, y: p1y, z: window.GROUNDWORK_ENGINE.getGroundZ(p1x, p1y) },
+            p2: { x: p2x, y: p2y, z: window.GROUNDWORK_ENGINE.getGroundZ(p2x, p2y) }
+          }, { silentUndo: true });
+          return;
+        }
+
+        if (this.dragState.type === 'line-endpoint') {
+          const ann = state.annotations.find(a => a.id === this.dragState.annId);
+          if (!ann) return;
+          const otherPt = this.dragState.endpoint === 'p1' ? ann.p2 : ann.p1;
+          const snapped = this._snapAnglePoint(otherPt, world, e.shiftKey);
+          this.api.updateAnnotation(ann.id, { [this.dragState.endpoint]: snapped }, { silentUndo: true });
+          return;
+        }
+
+        if (this.dragState.type === 'ann-move') {
+          const dx = world.x - this.dragState.startWorld.x;
+          const dy = world.y - this.dragState.startWorld.y;
+          if (this.dragState.kind === 'text') {
+            this.api.updateAnnotation(this.dragState.annId, {
+              x: this.dragState.orig.x + dx,
+              y: this.dragState.orig.y + dy
+            }, { silentUndo: true });
+          } else {
+            this.api.updateAnnotation(this.dragState.annId, {
+              p1: { x: this.dragState.orig.p1.x + dx, y: this.dragState.orig.p1.y + dy },
+              p2: { x: this.dragState.orig.p2.x + dx, y: this.dragState.orig.p2.y + dy }
+            }, { silentUndo: true });
+          }
           return;
         }
 
@@ -281,28 +508,27 @@
 
           const dims = window.GROUNDWORK_ENGINE.getEffectiveDims(orig, state.useGross);
           const lin = Math.sqrt(dims.grossFactor);
-          const footprintArea = orig.area / Math.max(1, orig.floors || 1);
+          const floors = Math.max(1, orig.floors || 1);
+          const footprintArea = orig.area / floors;
+          const locked = window.GROUNDWORK_PROGRAM.isAreaLocked(orig);
 
           let newW = orig.w;
           let newD = orig.d;
           const h = this.dragState.handle;
 
-          if (orig.freeResize) {
-            if (h.includes('e') || h.includes('w')) newW = Math.max(2.0, (Math.abs(lx) * 2) / lin);
-            if (h.includes('n') || h.includes('s')) newD = Math.max(2.0, (Math.abs(ly) * 2) / lin);
-            const newArea = Math.round(newW * newD * Math.max(1, orig.floors || 1) * 10) / 10;
+          if (!locked) {
+            if (h.includes('e') || h.includes('w')) newW = Math.max(0.8, (Math.abs(lx) * 2) / lin);
+            if (h.includes('n') || h.includes('s')) newD = Math.max(0.8, (Math.abs(ly) * 2) / lin);
+            const newArea = Math.round(newW * newD * floors * 10) / 10;
             this.api.updateVolume(orig.id, { w: newW, d: newD, area: newArea }, { silentUndo: true });
           } else {
-            // Strict area-locked resizing: stretching one axis adjusts the other cleanly
-            if (h === 'e' || h === 'w') {
-              newW = Math.max(1.8, Math.min(footprintArea / 1.8, (Math.abs(lx) * 2) / lin));
-              newD = footprintArea / newW;
-            } else if (h === 'n' || h === 's') {
-              newD = Math.max(1.8, Math.min(footprintArea / 1.8, (Math.abs(ly) * 2) / lin));
+            const minSide = Math.min(1.5, Math.max(0.5, Math.sqrt(footprintArea) * 0.5));
+            const maxSide = footprintArea / minSide;
+            if (h === 'n' || h === 's') {
+              newD = Math.max(minSide, Math.min(maxSide, (Math.abs(ly) * 2) / lin));
               newW = footprintArea / newD;
             } else {
-              // Corner handle: compute W from pointer X (clamped), lock D = Area / W
-              newW = Math.max(1.8, Math.min(footprintArea / 1.8, (Math.abs(lx) * 2) / lin));
+              newW = Math.max(minSide, Math.min(maxSide, (Math.abs(lx) * 2) / lin));
               newD = footprintArea / newW;
             }
             this.api.updateVolume(orig.id, { w: newW, d: newD }, { silentUndo: true });
@@ -311,7 +537,8 @@
         }
 
         if (this.dragState.type === 'sec-move') {
-          const plane = this.api.getActivePlane();
+          if (this.dragState.startPos && Math.hypot(pos.x - this.dragState.startPos.x, pos.y - this.dragState.startPos.y) < 4) return;
+          this.dragState.startPos = null;
           const dx = world.x - this.dragState.startWorld.x;
           const dy = world.y - this.dragState.startWorld.y;
           this.api.updateActivePlane({
@@ -322,6 +549,8 @@
         }
 
         if (this.dragState.type === 'sec-rotate') {
+          if (this.dragState.startPos && Math.hypot(pos.x - this.dragState.startPos.x, pos.y - this.dragState.startPos.y) < 4) return;
+          this.dragState.startPos = null;
           const orig = this.dragState.origPlane;
           let deg = Math.atan2(world.y - orig.cy, world.x - orig.cx) * 180 / Math.PI;
           if (this.dragState.handle === 'a') deg += 180;
@@ -350,6 +579,25 @@
 
       this.canvas.addEventListener('pointerup', (e) => {
         if (!this.dragState) return;
+        if (this.dragState.type === 'line-draw' && this.lineDraft) {
+          if (this.lineDraft.moved) {
+            const p2 = this.lineDraft.p2;
+            if (Math.hypot(p2.x - this.lineDraft.p1.x, p2.y - this.lineDraft.p1.y) > 0.25) {
+              this.api.addAnnotation({
+                type: 'line',
+                view: 'plan',
+                p1: { ...this.lineDraft.p1 },
+                p2: { ...p2 },
+                startCap: 'none',
+                endCap: 'arrow',
+                dashed: false,
+                strokeWidth: 1.5,
+                color: 'ink'
+              });
+            }
+            this.lineDraft = null;
+          }
+        }
         if (this.dragState.type === 'marquee') {
           const a = this.screenToWorld(this.dragState.startPos.x, this.dragState.startPos.y);
           const b = this.screenToWorld(this.dragState.currPos.x, this.dragState.currPos.y);
@@ -379,16 +627,121 @@
       });
     }
 
+    _snapAnglePoint(origin, target, shiftKey) {
+      if (!shiftKey || !origin) return { x: target.x, y: target.y };
+      const dx = target.x - origin.x;
+      const dy = target.y - origin.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 1e-6) return { x: target.x, y: target.y };
+      const step = Math.PI / 12; // 15 deg snap
+      const ang = Math.round(Math.atan2(dy, dx) / step) * step;
+      return { x: origin.x + Math.cos(ang) * dist, y: origin.y + Math.sin(ang) * dist };
+    }
+
     _updateCursorStyle(sx, sy, hitVol) {
       const state = this.api.getState();
       if (this.spaceHeld) { this.canvas.style.cursor = 'grab'; return; }
-      if (state.tool === 'dimension' || state.tool === 'section') {
+      if (state.tool === 'text') { this.canvas.style.cursor = 'text'; return; }
+      if (state.tool === 'dimension' || state.tool === 'section' || state.tool === 'line') {
         this.canvas.style.cursor = 'crosshair';
         return;
       }
+      if (this._hitTestSelectedDimEndpoint(sx, sy) || this._hitTestSelectedLineEndpoint(sx, sy)) {
+        this.canvas.style.cursor = 'pointer';
+        return;
+      }
+      if (this._isSectionActive(state) && this._hitTestSectionHandles(sx, sy, true)) {
+        this.canvas.style.cursor = 'move';
+        return;
+      }
       if (this._hitTestHandles(sx, sy)) { this.canvas.style.cursor = 'pointer'; return; }
-      if (this._hitTestSectionPlane(sx, sy)) { this.canvas.style.cursor = 'move'; return; }
+      if (this._hitTestDimTextBox(sx, sy) || this._hitTestSectionTextBoxes(sx, sy)) {
+        this.canvas.style.cursor = 'pointer';
+        return;
+      }
+      if (state.layers.annotations && this._hitTestAnnotations(sx, sy)) {
+        this.canvas.style.cursor = 'move';
+        return;
+      }
       this.canvas.style.cursor = hitVol ? 'move' : 'default';
+    }
+
+    _isSectionActive(state) {
+      return !!(
+        (state.selectedItem && state.selectedItem.kind === 'section') ||
+        state.tool === 'section' ||
+        (this.dragState && this.dragState.type && this.dragState.type.startsWith('sec-'))
+      );
+    }
+
+    _distPointToSegment(px, py, ax, ay, bx, by) {
+      const dx = bx - ax, dy = by - ay;
+      const len2 = dx * dx + dy * dy;
+      if (len2 < 1e-6) return Math.hypot(px - ax, py - ay);
+      const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len2));
+      return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+    }
+
+    _hitTestSelectedDimEndpoint(sx, sy) {
+      const state = this.api.getState();
+      if (!state.selectedItem || state.selectedItem.kind !== 'dim') return null;
+      const dim = state.dimensions.find(d => d.id === state.selectedItem.id && d.view === 'plan');
+      if (!dim) return null;
+      const s1 = this.worldToScreen(dim.p1.x, dim.p1.y);
+      const s2 = this.worldToScreen(dim.p2.x, dim.p2.y);
+      if (Math.hypot(sx - s1.x, sy - s1.y) <= 9) return { dim, endpoint: 'p1' };
+      if (Math.hypot(sx - s2.x, sy - s2.y) <= 9) return { dim, endpoint: 'p2' };
+      return null;
+    }
+
+    _hitTestDimTextBox(sx, sy) {
+      for (let i = this.dimHitBoxes.length - 1; i >= 0; i--) {
+        const b = this.dimHitBoxes[i];
+        if (sx >= b.x && sx <= b.x + b.w && sy >= b.y && sy <= b.y + b.h) return b;
+      }
+      return null;
+    }
+
+    _hitTestSelectedLineEndpoint(sx, sy) {
+      const state = this.api.getState();
+      if (!state.layers.annotations || !state.selectedItem || state.selectedItem.kind !== 'line') return null;
+      const ann = state.annotations.find(a => a.id === state.selectedItem.id && a.view === 'plan');
+      if (!ann) return null;
+      const s1 = this.worldToScreen(ann.p1.x, ann.p1.y);
+      const s2 = this.worldToScreen(ann.p2.x, ann.p2.y);
+      if (Math.hypot(sx - s1.x, sy - s1.y) <= 9) return { ann, endpoint: 'p1' };
+      if (Math.hypot(sx - s2.x, sy - s2.y) <= 9) return { ann, endpoint: 'p2' };
+      return null;
+    }
+
+    _hitTestAnnotations(sx, sy) {
+      const state = this.api.getState();
+      if (!state.layers.annotations) return null;
+      for (let i = this.annHitBoxes.length - 1; i >= 0; i--) {
+        const b = this.annHitBoxes[i];
+        if (sx >= b.x && sx <= b.x + b.w && sy >= b.y && sy <= b.y + b.h) {
+          const ann = state.annotations.find(a => a.id === b.id);
+          if (ann) return { kind: 'text', ann };
+        }
+      }
+      const lines = state.annotations.filter(a => a.view === 'plan' && a.type === 'line');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const ann = lines[i];
+        const s1 = this.worldToScreen(ann.p1.x, ann.p1.y);
+        const s2 = this.worldToScreen(ann.p2.x, ann.p2.y);
+        if (this._distPointToSegment(sx, sy, s1.x, s1.y, s2.x, s2.y) <= 6) {
+          return { kind: 'line', ann };
+        }
+      }
+      return null;
+    }
+
+    _hitTestSectionTextBoxes(sx, sy) {
+      for (let i = this.sectionTextBoxes.length - 1; i >= 0; i--) {
+        const b = this.sectionTextBoxes[i];
+        if (sx >= b.x && sx <= b.x + b.w && sy >= b.y && sy <= b.y + b.h) return b;
+      }
+      return null;
     }
 
     _hitTestVolume(wx, wy) {
@@ -441,7 +794,9 @@
       return null;
     }
 
-    _hitTestSectionPlane(sx, sy) {
+    _hitTestSectionHandles(sx, sy, onlyWhenActive) {
+      const state = this.api.getState();
+      if (onlyWhenActive && !this._isSectionActive(state)) return null;
       const plane = this.api.getActivePlane();
       if (!plane) return null;
       const basis = window.GROUNDWORK_ENGINE.getPlaneBasis(plane);
@@ -450,8 +805,9 @@
       const pB = this.worldToScreen(basis.cx + half * basis.tx, basis.cy + half * basis.ty);
       const pC = this.worldToScreen(basis.cx, basis.cy);
       if (Math.hypot(sx - pC.x, sy - pC.y) <= 10) return 'center';
-      if (Math.hypot(sx - pA.x, sy - pA.y) <= 10) return 'a';
-      if (Math.hypot(sx - pB.x, sy - pB.y) <= 10) return 'b';
+      if (Math.hypot(sx - pA.x, sy - pA.y) <= 12) return 'a';
+      if (Math.hypot(sx - pB.x, sy - pB.y) <= 12) return 'b';
+      if (this._distPointToSegment(sx, sy, pA.x, pA.y, pB.x, pB.y) <= 6) return 'body';
       return null;
     }
 
@@ -570,6 +926,9 @@
       if (w <= 0 || h <= 0) return;
 
       const pal = this._palette();
+      this.dimHitBoxes = [];
+      this.sectionTextBoxes = [];
+      this.annHitBoxes = [];
 
       ctx.save();
       ctx.scale(dpr, dpr);
@@ -580,8 +939,6 @@
       const site = window.GROUNDWORK_SITE;
       const eng = window.GROUNDWORK_ENGINE;
       const prog = window.GROUNDWORK_PROGRAM;
-
-      this._drawGrid(ctx, w, h, pal);
 
       // Roads
       if (state.layers.roads && site.roadContours) {
@@ -682,6 +1039,12 @@
           ctx.fill();
           ctx.stroke();
         }
+      }
+
+      // Unselected section line draws behind bubbles so labels stay uncluttered
+      const secActive = this._isSectionActive(state);
+      if (!secActive) {
+        this._drawSectionLineAndArrows(ctx, pal, false);
       }
 
       // Determine focus space for relevance grading (dragged or primary selected or hovered)
@@ -804,7 +1167,7 @@
         if (br.rel.sharedKeywords.length > 2) labels.push(`+${br.rel.sharedKeywords.length - 2}`);
         const text = labels.join(' · ');
 
-        const accentCat = prog.CATEGORIES[(focusVol ? focusVol : br.A).cat];
+        const accentCat = prog.getSpaceStyle(focusVol ? focusVol : br.A);
         ctx.save();
         ctx.font = '600 9.5px sans-serif';
         const tw = ctx.measureText(text).width + 12;
@@ -828,15 +1191,41 @@
         if (sel) this._drawHandles(ctx, sel, state.useGross, pal);
       }
 
-      // Active Clipping Plane line
-      this._drawSectionPlane(ctx, pal);
+      // Clipping Plane: when selected/active render full line+handles in front; when unselected render only clickable text boxes
+      if (secActive) {
+        this._drawSectionLineAndArrows(ctx, pal, true);
+        this._drawSectionBadgesAndHandles(ctx, pal, true, w, h);
+      } else {
+        this._drawSectionBadgesAndHandles(ctx, pal, false, w, h);
+      }
 
       // Saved Plan dimensions + draft
       for (const dim of state.dimensions.filter(d => d.view === 'plan')) {
-        this._drawDimension(ctx, dim.p1, dim.p2, false, pal);
+        const isSelDim = !!(state.selectedItem && state.selectedItem.kind === 'dim' && state.selectedItem.id === dim.id);
+        this._drawDimension(ctx, dim, false, isSelDim, pal);
       }
       if (this.dimDraft) {
-        this._drawDimension(ctx, this.dimDraft.p1, this.dimDraft.p2, true, pal);
+        this._drawDimension(ctx, this.dimDraft, true, false, pal);
+      }
+
+      // Plan Annotations (Lines/Arrows & Text)
+      if (state.layers.annotations) {
+        for (const ann of (state.annotations || []).filter(a => a.view === 'plan')) {
+          const isSelAnn = !!(state.selectedItem && state.selectedItem.id === ann.id);
+          if (ann.type === 'line') this._drawLineAnnotation(ctx, ann, false, isSelAnn, pal);
+          else if (ann.type === 'text') this._drawTextAnnotation(ctx, ann, isSelAnn, pal);
+        }
+      }
+      if (this.lineDraft) {
+        this._drawLineAnnotation(ctx, {
+          p1: this.lineDraft.p1,
+          p2: this.lineDraft.p2,
+          startCap: 'none',
+          endCap: 'arrow',
+          dashed: true,
+          strokeWidth: 1.5,
+          color: 'ink'
+        }, true, false, pal);
       }
 
       // Marquee box
@@ -858,36 +1247,6 @@
       ctx.restore();
     }
 
-    _drawGrid(ctx, w, h, pal) {
-      const tl = this.screenToWorld(0, 0);
-      const br = this.screenToWorld(w, h);
-      const minX = Math.floor(Math.min(tl.x, br.x) / 10) * 10;
-      const maxX = Math.ceil(Math.max(tl.x, br.x) / 10) * 10;
-      const minY = Math.floor(Math.min(tl.y, br.y) / 10) * 10;
-      const maxY = Math.ceil(Math.max(tl.y, br.y) / 10) * 10;
-
-      ctx.save();
-      for (let x = minX; x <= maxX; x += 10) {
-        const s = this.worldToScreen(x, 0);
-        ctx.strokeStyle = (x % 50 === 0) ? pal.gridMajor : pal.gridMinor;
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(s.x, 0);
-        ctx.lineTo(s.x, h);
-        ctx.stroke();
-      }
-      for (let y = minY; y <= maxY; y += 10) {
-        const s = this.worldToScreen(0, y);
-        ctx.strokeStyle = (y % 50 === 0) ? pal.gridMajor : pal.gridMinor;
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(0, s.y);
-        ctx.lineTo(w, s.y);
-        ctx.stroke();
-      }
-      ctx.restore();
-    }
-
     _strokePoly(ctx, pts, closed, fill, fillOnly) {
       if (!pts || pts.length < 2) return;
       ctx.beginPath();
@@ -902,15 +1261,17 @@
     }
 
     _drawBubble(ctx, vol, useGross, isSelected, isFocus, rel, activeKws, mergedSet, pal) {
-      const cat = window.GROUNDWORK_PROGRAM.CATEGORIES[vol.cat];
+      const state = this.api.getState();
+      const cat = window.GROUNDWORK_PROGRAM.getSpaceStyle(vol);
       const dims = window.GROUNDWORK_ENGINE.getEffectiveDims(vol, useGross);
       const center = this.worldToScreen(vol.x, vol.y);
       const pw = dims.w * this.cam.pxPerM;
       const pd = dims.d * this.cam.pxPerM;
+      const theta = -(vol.rot || 0);
 
       ctx.save();
       ctx.translate(center.x, center.y);
-      ctx.rotate(-(vol.rot || 0));
+      ctx.rotate(theta);
 
       // Compute fill & relevance-graded outline saturation
       let fillAlpha = 0.28;
@@ -947,7 +1308,6 @@
       const areaStr = dims.floors > 1
         ? `${dims.totalArea.toFixed(0)} m² (${dims.floors}F · ${dims.footprintArea.toFixed(1)}/F)`
         : `${dims.totalArea.toFixed(0)} m²`;
-      const dimStr = `${dims.w.toFixed(1)}×${dims.d.toFixed(1)}m`;
 
       ctx.fillStyle = pal.ink;
       ctx.textAlign = 'center';
@@ -957,20 +1317,14 @@
       if (pw >= 34 && pd >= 22) {
         const title = `${vol.ref} ${vol.short}`;
         ctx.font = '600 11px sans-serif';
-        ctx.fillText(this._truncate(ctx, title, maxTextW), 0, pd > 46 ? -10 : -4);
+        ctx.fillText(this._truncate(ctx, title, maxTextW), 0, pd > 46 ? -8 : -4);
 
         ctx.font = '10.5px ui-monospace, monospace';
         ctx.fillStyle = pal.inkSub;
-        ctx.fillText(this._truncate(ctx, areaStr, maxTextW), 0, pd > 46 ? 4 : 8);
-
-        if (pd >= 60) {
-          ctx.font = '9.5px ui-monospace, monospace';
-          ctx.fillStyle = pal.inkMuted;
-          ctx.fillText(dimStr, 0, 17);
-        }
+        ctx.fillText(this._truncate(ctx, areaStr, maxTextW), 0, pd > 46 ? 6 : 8);
 
         // Active keywords (exclude already merged ones so bridge stays clean)
-        if (pd >= 76 && pw >= 68) {
+        if (pd >= 66 && pw >= 60) {
           const activeList = (vol.keywords || [])
             .filter(k => activeKws.has(k) && !(mergedSet && mergedSet.has(k)))
             .map(k => this.api.getKeywordLabel(k));
@@ -978,7 +1332,7 @@
             ctx.font = '9.5px sans-serif';
             ctx.fillStyle = pal.inkSoft;
             const kwText = this._truncate(ctx, activeList.slice(0, 3).join(' · '), maxTextW);
-            ctx.fillText(kwText, 0, 30);
+            ctx.fillText(kwText, 0, 22);
           }
         }
       } else {
@@ -1003,6 +1357,61 @@
         ctx.textBaseline = 'top';
         ctx.fillStyle = cat.color;
         ctx.fillText(pct, pw * 0.5 - 4, -pd * 0.5 + 3);
+      }
+
+      // Zoom-adaptive exterior rectangle dimensions (width & depth along adjacent outer edges)
+      if (state.layers.rectDims && this.cam.pxPerM >= 7.5 && pw >= 38 && pd >= 24) {
+        const fmt = (v) => Number(v.toFixed(2)) + ' m';
+        const wLabel = fmt(dims.w);
+        const dLabel = fmt(dims.d);
+        const topY = -pd * 0.5 - 8;
+        const leftX = -pw * 0.5 - 8;
+
+        ctx.strokeStyle = pal.inkMuted;
+        ctx.lineWidth = 0.85;
+        ctx.globalAlpha = isSelected ? 0.92 : 0.72;
+
+        // Top width dim line + ticks
+        ctx.beginPath();
+        ctx.moveTo(-pw * 0.5, topY - 2.5); ctx.lineTo(-pw * 0.5, topY + 2.5);
+        ctx.moveTo(pw * 0.5, topY - 2.5); ctx.lineTo(pw * 0.5, topY + 2.5);
+        ctx.moveTo(-pw * 0.5, topY); ctx.lineTo(pw * 0.5, topY);
+        ctx.stroke();
+
+        // Left depth dim line + ticks
+        ctx.beginPath();
+        ctx.moveTo(leftX - 2.5, -pd * 0.5); ctx.lineTo(leftX + 2.5, -pd * 0.5);
+        ctx.moveTo(leftX - 2.5, pd * 0.5); ctx.lineTo(leftX + 2.5, pd * 0.5);
+        ctx.moveTo(leftX, -pd * 0.5); ctx.lineTo(leftX, pd * 0.5);
+        ctx.stroke();
+
+        ctx.font = '600 9.5px ui-monospace, monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.globalAlpha = 1;
+
+        // Width label on top edge
+        ctx.save();
+        ctx.translate(0, topY);
+        if (Math.cos(theta) < -0.1) ctx.rotate(Math.PI);
+        const twW = ctx.measureText(wLabel).width + 6;
+        ctx.fillStyle = pal.bg;
+        ctx.fillRect(-twW * 0.5, -6, twW, 12);
+        ctx.fillStyle = pal.inkSub;
+        ctx.fillText(wLabel, 0, 0);
+        ctx.restore();
+
+        // Depth label on left edge
+        ctx.save();
+        ctx.translate(leftX, 0);
+        ctx.rotate(-Math.PI * 0.5);
+        if (Math.cos(theta - Math.PI * 0.5) < -0.15) ctx.rotate(Math.PI);
+        const twD = ctx.measureText(dLabel).width + 6;
+        ctx.fillStyle = pal.bg;
+        ctx.fillRect(-twD * 0.5, -6, twD, 12);
+        ctx.fillStyle = pal.inkSub;
+        ctx.fillText(dLabel, 0, 0);
+        ctx.restore();
       }
 
       ctx.restore();
@@ -1039,18 +1448,18 @@
       ctx.restore();
     }
 
-    _drawSectionPlane(ctx, pal) {
+    _drawSectionLineAndArrows(ctx, pal, isActive) {
       const plane = this.api.getActivePlane();
       if (!plane) return;
       const basis = window.GROUNDWORK_ENGINE.getPlaneBasis(plane);
       const half = 65;
       const pA = this.worldToScreen(basis.cx - half * basis.tx, basis.cy - half * basis.ty);
       const pB = this.worldToScreen(basis.cx + half * basis.tx, basis.cy + half * basis.ty);
-      const pC = this.worldToScreen(basis.cx, basis.cy);
 
       ctx.save();
+      ctx.globalAlpha = isActive ? 1 : 0.42;
       ctx.strokeStyle = plane.enabled ? pal.sectionStroke : pal.sectionMuted;
-      ctx.lineWidth = plane.enabled ? 1.8 : 1.2;
+      ctx.lineWidth = isActive ? (plane.enabled ? 2.1 : 1.4) : (plane.enabled ? 1.3 : 1.0);
       ctx.setLineDash([9, 4, 2, 4]);
       ctx.beginPath();
       ctx.moveTo(pA.x, pA.y);
@@ -1059,10 +1468,7 @@
       ctx.setLineDash([]);
 
       // View direction arrows (pointing into kept side: basis.vx, basis.vy)
-      const dirScreen = {
-        x: basis.vx,
-        y: -basis.vy
-      };
+      const dirScreen = { x: basis.vx, y: -basis.vy };
       for (const endPt of [pA, pB]) {
         const tip = { x: endPt.x + dirScreen.x * 16, y: endPt.y + dirScreen.y * 16 };
         ctx.beginPath();
@@ -1079,42 +1485,88 @@
         ctx.fillStyle = ctx.strokeStyle;
         ctx.fill();
       }
-
-      // Section labels A and A' + center grab circle
-      ctx.fillStyle = pal.sectionCenterOff;
-      ctx.strokeStyle = pal.sectionStroke;
-      ctx.lineWidth = 1.4;
-      for (const [pt, lbl] of [[pA, plane.name || 'A'], [pB, (plane.name || 'A') + "'"]]) {
-        ctx.beginPath();
-        ctx.arc(pt.x, pt.y, 9, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = pal.sectionStroke;
-        ctx.font = '600 10px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(lbl, pt.x, pt.y + 0.5);
-        ctx.fillStyle = pal.sectionCenterOff;
-      }
-
-      ctx.beginPath();
-      ctx.arc(pC.x, pC.y, 5, 0, Math.PI * 2);
-      ctx.fillStyle = plane.enabled ? pal.sectionStroke : pal.sectionCenterOff;
-      ctx.fill();
-      ctx.stroke();
       ctx.restore();
     }
 
-    _drawDimension(ctx, p1, p2, isDraft, pal) {
+    _drawSectionBadgesAndHandles(ctx, pal, isActive, w, h) {
+      const plane = this.api.getActivePlane();
+      if (!plane) return;
+      const basis = window.GROUNDWORK_ENGINE.getPlaneBasis(plane);
+      const half = 65;
+      const pA = this.worldToScreen(basis.cx - half * basis.tx, basis.cy - half * basis.ty);
+      const pB = this.worldToScreen(basis.cx + half * basis.tx, basis.cy + half * basis.ty);
+      const pC = this.worldToScreen(basis.cx, basis.cy);
+      const name = plane.name || 'A';
+
+      const drawBadge = (cx, cy, label, handleKey) => {
+        ctx.font = '600 10px sans-serif';
+        const bw = Math.max(22, ctx.measureText(label).width + 12);
+        const bh = 18;
+        const bx = cx - bw * 0.5;
+        const by = cy - bh * 0.5;
+        ctx.fillStyle = isActive ? pal.sectionStroke : pal.dimBg;
+        ctx.strokeStyle = isActive ? pal.sectionStroke : pal.dimBorder;
+        ctx.lineWidth = isActive ? 1.6 : 1.1;
+        this._roundRect(ctx, bx, by, bw, bh, 4);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = isActive ? pal.sectionCenterOff : pal.ink;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(label, cx, cy + 0.5);
+        this.sectionTextBoxes.push({ planeId: plane.id, handle: handleKey, x: bx, y: by, w: bw, h: bh });
+      };
+
+      ctx.save();
+      drawBadge(pA.x, pA.y, `Sec ${name}`, 'a');
+      drawBadge(pB.x, pB.y, `${name}'`, 'b');
+
+      // When zoomed in and both endpoint text boxes fall outside the viewport, clip line against inner margin box
+      const inView = (pt) => pt.x >= 20 && pt.x <= w - 20 && pt.y >= 36 && pt.y <= h - 22;
+      if (!inView(pA) && !inView(pB)) {
+        const minX = 46, maxX = Math.max(50, w - 46);
+        const minY = 48, maxY = Math.max(52, h - 34);
+        const dx = pB.x - pA.x, dy = pB.y - pA.y;
+        let t0 = 0, t1 = 1;
+        const clip = (p, q) => {
+          if (Math.abs(p) < 1e-8) return q >= 0;
+          const r = q / p;
+          if (p < 0) { if (r > t1) return false; if (r > t0) t0 = r; }
+          else { if (r < t0) return false; if (r < t1) t1 = r; }
+          return true;
+        };
+        if (clip(-dx, pA.x - minX) && clip(dx, maxX - pA.x) && clip(-dy, pA.y - minY) && clip(dy, maxY - pA.y) && t0 <= t1) {
+          const ex = pA.x + t0 * dx;
+          const ey = pA.y + t0 * dy;
+          drawBadge(ex, ey, `Sec ${name}–${name}'`, 'body');
+        }
+      }
+
+      // Center grab handle + endpoint rotate dots ONLY when section is active/selected
+      if (isActive) {
+        ctx.beginPath();
+        ctx.arc(pC.x, pC.y, 5.5, 0, Math.PI * 2);
+        ctx.fillStyle = plane.enabled ? pal.sectionStroke : pal.sectionCenterOff;
+        ctx.strokeStyle = pal.handleFill;
+        ctx.lineWidth = 1.5;
+        ctx.fill();
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    _drawDimension(ctx, dim, isDraft, isSelected, pal) {
+      const p1 = dim.p1, p2 = dim.p2;
       const s1 = this.worldToScreen(p1.x, p1.y);
       const s2 = this.worldToScreen(p2.x, p2.y);
       const dHoriz = Math.hypot(p2.x - p1.x, p2.y - p1.y);
       const dz = p2.z - p1.z;
       const slope = dHoriz > 0.1 ? (Math.abs(dz) / dHoriz) * 100 : 0;
+      const screenDist = Math.hypot(s2.x - s1.x, s2.y - s1.y);
 
       ctx.save();
       ctx.strokeStyle = isDraft ? pal.dimDraft : pal.dimStroke;
-      ctx.lineWidth = 1.25;
+      ctx.lineWidth = isSelected ? 1.9 : 1.25;
       if (isDraft) ctx.setLineDash([4, 3]);
       ctx.beginPath();
       ctx.moveTo(s1.x, s1.y);
@@ -1123,27 +1575,155 @@
       ctx.setLineDash([]);
 
       for (const s of [s1, s2]) {
-        ctx.fillStyle = pal.handleFill;
+        ctx.fillStyle = isSelected ? pal.handleFill : pal.dimStroke;
+        ctx.strokeStyle = isDraft ? pal.dimDraft : pal.dimStroke;
+        ctx.lineWidth = isSelected ? 1.7 : 1.1;
         ctx.beginPath();
-        ctx.arc(s.x, s.y, 3.5, 0, Math.PI * 2);
+        ctx.arc(s.x, s.y, isSelected ? 5.2 : 2.8, 0, Math.PI * 2);
         ctx.fill();
-        ctx.stroke();
+        if (isSelected) ctx.stroke();
       }
 
-      const mx = (s1.x + s2.x) * 0.5;
-      const my = (s1.y + s2.y) * 0.5;
-      const label = `${dHoriz.toFixed(2)} m · ΔZ ${dz >= 0 ? '+' : ''}${dz.toFixed(2)} m (${slope.toFixed(0)}%)`;
-      ctx.font = '500 10.5px ui-monospace, monospace';
-      const tw = ctx.measureText(label).width + 10;
-      ctx.fillStyle = pal.dimBg;
-      ctx.strokeStyle = pal.dimBorder;
-      ctx.lineWidth = 1;
-      ctx.fillRect(mx - tw * 0.5, my - 18, tw, 17);
-      ctx.strokeRect(mx - tw * 0.5, my - 18, tw, 17);
-      ctx.fillStyle = pal.ink;
+      // Auto-hide dimension text box when zoomed out enough (unless selected or draft)
+      const showBox = isDraft || isSelected || (this.cam.pxPerM >= 4.6 && screenDist >= 54);
+      if (showBox) {
+        const mx = (s1.x + s2.x) * 0.5;
+        const my = (s1.y + s2.y) * 0.5;
+        const label = `${dHoriz.toFixed(2)} m · ΔZ ${dz >= 0 ? '+' : ''}${dz.toFixed(2)} m (${slope.toFixed(0)}%)`;
+        ctx.font = '500 10.5px ui-monospace, monospace';
+        const tw = ctx.measureText(label).width + 10;
+        const bx = mx - tw * 0.5;
+        const by = my - 18;
+        const bh = 17;
+        ctx.fillStyle = pal.dimBg;
+        ctx.strokeStyle = isSelected ? pal.ink : pal.dimBorder;
+        ctx.lineWidth = isSelected ? 1.6 : 1;
+        ctx.fillRect(bx, by, tw, bh);
+        ctx.strokeRect(bx, by, tw, bh);
+        ctx.fillStyle = pal.ink;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(label, mx, by + bh * 0.5);
+        if (!isDraft && dim.id) {
+          this.dimHitBoxes.push({ id: dim.id, x: bx, y: by, w: tw, h: bh });
+        }
+      }
+      ctx.restore();
+    }
+
+    _resolveAnnColor(colorVal, pal) {
+      return (colorVal && colorVal !== 'ink') ? colorVal : pal.ink;
+    }
+
+    _drawCap(ctx, pt, dirX, dirY, capType, sw, color) {
+      if (!capType || capType === 'none') return;
+      const ang = Math.atan2(dirY, dirX);
+      const sz = 7 + sw * 1.4;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = Math.max(1.2, sw);
+      if (capType === 'arrow') {
+        ctx.beginPath();
+        ctx.moveTo(pt.x, pt.y);
+        ctx.lineTo(pt.x - Math.cos(ang - 0.42) * sz, pt.y - Math.sin(ang - 0.42) * sz);
+        ctx.lineTo(pt.x - Math.cos(ang + 0.42) * sz, pt.y - Math.sin(ang + 0.42) * sz);
+        ctx.closePath();
+        ctx.fill();
+      } else if (capType === 'open-arrow') {
+        ctx.beginPath();
+        ctx.moveTo(pt.x - Math.cos(ang - 0.45) * sz, pt.y - Math.sin(ang - 0.45) * sz);
+        ctx.lineTo(pt.x, pt.y);
+        ctx.lineTo(pt.x - Math.cos(ang + 0.45) * sz, pt.y - Math.sin(ang + 0.45) * sz);
+        ctx.stroke();
+      } else if (capType === 'dot') {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 2.5 + sw * 0.7, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (capType === 'tick') {
+        const px = -dirY, py = dirX;
+        const ts = 5 + sw;
+        ctx.beginPath();
+        ctx.moveTo(pt.x - (dirX * 0.4 + px) * ts * 0.6, pt.y - (dirY * 0.4 + py) * ts * 0.6);
+        ctx.lineTo(pt.x + (dirX * 0.4 + px) * ts * 0.6, pt.y + (dirY * 0.4 + py) * ts * 0.6);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    _drawLineAnnotation(ctx, ann, isDraft, isSelected, pal) {
+      const s1 = this.worldToScreen(ann.p1.x, ann.p1.y);
+      const s2 = this.worldToScreen(ann.p2.x, ann.p2.y);
+      const col = this._resolveAnnColor(ann.color, pal);
+      const sw = ann.strokeWidth || 1.5;
+
+      ctx.save();
+      ctx.strokeStyle = col;
+      ctx.lineWidth = isSelected ? sw + 0.8 : sw;
+      if (ann.dashed || isDraft) ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.moveTo(s1.x, s1.y);
+      ctx.lineTo(s2.x, s2.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      const dx = s2.x - s1.x, dy = s2.y - s1.y;
+      const len = Math.hypot(dx, dy);
+      if (len > 4) {
+        const ux = dx / len, uy = dy / len;
+        this._drawCap(ctx, s1, -ux, -uy, ann.startCap || 'none', sw, col);
+        this._drawCap(ctx, s2, ux, uy, ann.endCap || 'arrow', sw, col);
+      }
+
+      if (isSelected) {
+        for (const s of [s1, s2]) {
+          ctx.fillStyle = pal.handleFill;
+          ctx.strokeStyle = pal.ink;
+          ctx.lineWidth = 1.6;
+          ctx.beginPath();
+          ctx.arc(s.x, s.y, 5.2, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+
+    _drawTextAnnotation(ctx, ann, isSelected, pal) {
+      const s = this.worldToScreen(ann.x, ann.y);
+      const col = this._resolveAnnColor(ann.color, pal);
+      const fs = ann.fontSize || 12;
+      const label = ann.text || '';
+      if (!label) return;
+
+      ctx.save();
+      ctx.font = `600 ${fs}px sans-serif`;
+      const tw = ctx.measureText(label).width + 12;
+      const th = fs + 8;
+      const bx = s.x - tw * 0.5;
+      const by = s.y - th * 0.5;
+
+      if (ann.boxed || isSelected) {
+        ctx.fillStyle = pal.dimBg;
+        ctx.strokeStyle = isSelected ? pal.ink : col;
+        ctx.lineWidth = isSelected ? 1.4 : 1;
+        this._roundRect(ctx, bx, by, tw, th, 4);
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = pal.bg;
+        ctx.lineWidth = 3;
+        ctx.lineJoin = 'round';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.strokeText(label, s.x, s.y);
+      }
+
+      ctx.fillStyle = col;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(label, mx, my - 9);
+      ctx.fillText(label, s.x, s.y);
+      this.annHitBoxes.push({ id: ann.id, x: bx, y: by, w: tw, h: th });
       ctx.restore();
     }
 
@@ -1290,7 +1870,7 @@
       const activeKws = this.api.getActiveKeywordSet();
       const vols = [...state.volumes].sort((a, b) => (a.zOrder || 0) - (b.zOrder || 0));
       for (const vol of vols) {
-        const cat = prog.CATEGORIES[vol.cat];
+        const cat = prog.getSpaceStyle(vol);
         const dims = eng.getEffectiveDims(vol, state.useGross);
         const center = toS(vol.x, vol.y);
         const pw = dims.w * this.cam.pxPerM;
@@ -1298,8 +1878,12 @@
         const deg = -((vol.rot || 0) * 180 / Math.PI);
         parts.push(`<g transform="translate(${center.x},${center.y}) rotate(${deg.toFixed(2)})">`);
         parts.push(`<rect x="${(-pw / 2).toFixed(2)}" y="${(-pd / 2).toFixed(2)}" width="${pw.toFixed(2)}" height="${pd.toFixed(2)}" fill="${cat.color}" fill-opacity="0.30" stroke="${cat.color}" stroke-width="1.4"/>`);
-        parts.push(`<text x="0" y="-3" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="600" fill="${pal.ink}">${this._esc(vol.ref + ' ' + vol.short)}</text>`);
+        parts.push(`<text x="0" y="-3" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="600" fill="${pal.ink}">${this._esc((vol.ref || vol.id) + ' ' + vol.short)}</text>`);
         parts.push(`<text x="0" y="11" text-anchor="middle" font-family="monospace" font-size="10" fill="${pal.inkSub}">${dims.totalArea.toFixed(0)} m²</text>`);
+        if (state.layers.rectDims && this.cam.pxPerM >= 7.5 && pw >= 38 && pd >= 24) {
+          parts.push(`<text x="0" y="${(-pd / 2 - 6).toFixed(2)}" text-anchor="middle" font-family="monospace" font-size="9.5" fill="${pal.inkSub}">${Number(dims.w.toFixed(2))} m</text>`);
+          parts.push(`<text x="${(-pw / 2 - 6).toFixed(2)}" y="0" text-anchor="middle" transform="rotate(-90 ${(-pw / 2 - 6).toFixed(2)} 0)" font-family="monospace" font-size="9.5" fill="${pal.inkSub}">${Number(dims.d.toFixed(2))} m</text>`);
+        }
         parts.push(`</g>`);
       }
 
@@ -1316,6 +1900,21 @@
           const txt = rel.sharedKeywords.slice(0, 3).map(k => this.api.getKeywordLabel(k)).join(' · ');
           parts.push(`<line x1="${pA.x}" y1="${pA.y}" x2="${pB.x}" y2="${pB.y}" stroke="${pal.linkDirect}" stroke-width="1"/>`);
           parts.push(`<text x="${mx.toFixed(1)}" y="${my.toFixed(1)}" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="${pal.ink}">${this._esc(txt)}</text>`);
+        }
+      }
+
+      // Annotations (SVG)
+      if (state.layers.annotations) {
+        for (const ann of (state.annotations || []).filter(a => a.view === 'plan')) {
+          const col = this._resolveAnnColor(ann.color, pal);
+          if (ann.type === 'line') {
+            const p1 = toS(ann.p1.x, ann.p1.y), p2 = toS(ann.p2.x, ann.p2.y);
+            const dash = ann.dashed ? ' stroke-dasharray="5 4"' : '';
+            parts.push(`<line x1="${p1.x}" y1="${p1.y}" x2="${p2.x}" y2="${p2.y}" stroke="${col}" stroke-width="${ann.strokeWidth || 1.5}"${dash}/>`);
+          } else if (ann.type === 'text') {
+            const p = toS(ann.x, ann.y);
+            parts.push(`<text x="${p.x}" y="${p.y}" text-anchor="middle" dominant-baseline="central" font-family="sans-serif" font-size="${ann.fontSize || 12}" font-weight="600" fill="${col}">${this._esc(ann.text || '')}</text>`);
+          }
         }
       }
 

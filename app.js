@@ -37,10 +37,13 @@
       dockOpen: true,
       keywords: cloneKeywords(),
       volumes: [],
+      customSpaces: [],
       selectedIds: [],
+      selectedItem: null,
       planes: [createDefaultPlane()],
       activePlaneId: 'sec-A',
       dimensions: [],
+      annotations: [],
       layers: {
         siteBoundary: true,
         contours: true,
@@ -50,11 +53,14 @@
         plotBuildings: false,
         trees: true,
         cutFill: true,
-        translucentTerrain: false
+        translucentTerrain: false,
+        rectDims: true,
+        annotations: true
       },
       iterations: [],
       nextGroupNum: 1,
-      nextZOrder: 1
+      nextZOrder: 1,
+      nextCustomNum: 1
     };
   }
 
@@ -62,6 +68,17 @@
   let undoStack = [];
   let redoStack = [];
   let kwSearch = '';
+
+  function normalizeVolume(v) {
+    const locked = prog.isAreaLocked(v);
+    return {
+      ...v,
+      areaLocked: locked,
+      freeResize: !locked,
+      floors: Math.max(1, v.floors || 1),
+      floorHeight: v.floorHeight || prog.DEFAULT_FLOOR_HEIGHT
+    };
+  }
 
   function loadInitialState() {
     try {
@@ -84,10 +101,14 @@
       layers: { ...def.layers, ...(s.layers || {}) },
       keywords: Array.isArray(s.keywords) && s.keywords.length ? s.keywords : def.keywords,
       planes: Array.isArray(s.planes) && s.planes.length ? s.planes : def.planes,
-      volumes: Array.isArray(s.volumes) ? s.volumes : [],
+      volumes: Array.isArray(s.volumes) ? s.volumes.map(normalizeVolume) : [],
+      customSpaces: Array.isArray(s.customSpaces) ? s.customSpaces.map(normalizeVolume) : [],
       selectedIds: Array.isArray(s.selectedIds) ? s.selectedIds : [],
+      selectedItem: s.selectedItem && s.selectedItem.kind ? s.selectedItem : null,
       dimensions: Array.isArray(s.dimensions) ? s.dimensions : [],
-      iterations: Array.isArray(s.iterations) ? s.iterations : []
+      annotations: Array.isArray(s.annotations) ? s.annotations : [],
+      iterations: Array.isArray(s.iterations) ? s.iterations : [],
+      nextCustomNum: Number.isFinite(s.nextCustomNum) ? s.nextCustomNum : 1
     };
   }
 
@@ -100,13 +121,17 @@
   function snapshotForUndo() {
     return JSON.stringify({
       volumes: state.volumes,
+      customSpaces: state.customSpaces,
       planes: state.planes,
       activePlaneId: state.activePlaneId,
       dimensions: state.dimensions,
+      annotations: state.annotations,
       keywords: state.keywords,
       selectedIds: state.selectedIds,
+      selectedItem: state.selectedItem,
       nextGroupNum: state.nextGroupNum,
-      nextZOrder: state.nextZOrder
+      nextZOrder: state.nextZOrder,
+      nextCustomNum: state.nextCustomNum
     });
   }
 
@@ -160,59 +185,79 @@
   function selectVolume(id, expandGroup = true) {
     const vol = getVolume(id);
     if (!vol) return;
+    state.selectedItem = null;
     if (expandGroup && vol.groupId) {
       state.selectedIds = state.volumes.filter(v => v.groupId === vol.groupId).map(v => v.id);
     } else {
       state.selectedIds = [id];
     }
-    refreshAll();
+    refreshAll({ forceSidebar: true });
   }
 
   function toggleSelect(id) {
+    state.selectedItem = null;
     const idx = state.selectedIds.indexOf(id);
     if (idx >= 0) state.selectedIds.splice(idx, 1);
     else state.selectedIds.push(id);
-    refreshAll();
+    refreshAll({ forceSidebar: true });
   }
 
   function setSelection(ids) {
+    state.selectedItem = null;
     state.selectedIds = ids.slice();
-    refreshAll();
+    refreshAll({ forceSidebar: true });
+  }
+
+  function selectItem(kind, id) {
+    state.selectedIds = [];
+    state.selectedItem = kind && id ? { kind, id } : null;
+    refreshAll({ forceSidebar: true });
   }
 
   function clearSelection() {
-    if (state.selectedIds.length === 0) return;
+    if (state.selectedIds.length === 0 && !state.selectedItem) return;
     state.selectedIds = [];
-    refreshAll();
+    state.selectedItem = null;
+    refreshAll({ forceSidebar: true });
+  }
+
+  function getSpaceTemplate(spaceId) {
+    return catalogById.get(spaceId) || state.customSpaces.find(s => s.id === spaceId) || null;
   }
 
   function createVolumeFromSpace(space, x, y) {
-    const w = Math.round(Math.sqrt(space.area * (space.aspect || 1.4)) * 100) / 100;
-    const d = space.area / w;
+    const floors = Math.max(1, space.floors || 1);
+    const fpArea = space.area / floors;
+    const w = Math.round(Math.sqrt(fpArea * (space.aspect || 1.4)) * 100) / 100;
+    const d = fpArea / w;
     const gz = eng.getGroundZ(x, y);
+    const locked = prog.isAreaLocked(space);
     return {
       id: space.id,
       ref: space.ref,
       name: space.name,
       short: space.short,
-      cat: space.cat,
+      cat: space.cat || 'CUSTOM',
+      customColor: space.customColor || null,
+      isCustom: !!space.isCustom,
       area: space.area,
-      freeResize: !!space.freeResize,
+      areaLocked: locked,
+      freeResize: !locked,
       excludeFromNetTotal: !!space.excludeFromNetTotal,
       w,
       d,
-      floors: 1,
-      floorHeight: prog.DEFAULT_FLOOR_HEIGHT,
+      floors,
+      floorHeight: space.floorHeight || prog.DEFAULT_FLOOR_HEIGHT,
       rot: 0,
       x,
       y,
       zBase: Math.round(gz * 100) / 100,
       groupId: null,
       zOrder: state.nextZOrder++,
-      keywords: space.keywords.slice(),
-      links: space.links.slice(),
-      separations: space.separations.slice(),
-      note: space.note
+      keywords: (space.keywords || []).slice(),
+      links: (space.links || []).slice(),
+      separations: (space.separations || []).slice(),
+      note: space.note || ''
     };
   }
 
@@ -228,13 +273,14 @@
       selectVolume(existing.id, false);
       return;
     }
-    const space = catalogById.get(spaceId);
+    const space = getSpaceTemplate(spaceId);
     if (!space) return;
     pushUndo();
     const vol = createVolumeFromSpace(space, x, y);
     state.volumes.push(vol);
     state.selectedIds = [vol.id];
-    refreshAll();
+    state.selectedItem = null;
+    refreshAll({ forceSidebar: true });
   }
 
   function smartPlaceFromDock(spaceId) {
@@ -252,11 +298,92 @@
     placeSpaceAt(spaceId, sx, sy);
   }
 
+  function syncCustomTemplateFromVolume(vol) {
+    if (!vol || !vol.isCustom) return;
+    const tpl = state.customSpaces.find(s => s.id === vol.id);
+    if (!tpl) return;
+    tpl.name = vol.name;
+    tpl.short = vol.short;
+    tpl.ref = vol.ref;
+    tpl.note = vol.note;
+    tpl.customColor = vol.customColor;
+    tpl.area = vol.area;
+    tpl.areaLocked = vol.areaLocked;
+    tpl.freeResize = vol.freeResize;
+    tpl.floors = vol.floors;
+    tpl.floorHeight = vol.floorHeight;
+    tpl.keywords = (vol.keywords || []).slice();
+  }
+
+  function createCustomBubble({ name, ref, note, customColor, area, areaLocked, floors, floorHeight }) {
+    pushUndo();
+    const num = state.nextCustomNum++;
+    const cleanName = (name || '').trim() || `Custom Space ${num}`;
+    const cleanRef = (ref || '').trim() || `U${num}`;
+    const cleanShort = cleanName.length > 14 ? cleanName.slice(0, 13).trim() + '…' : cleanName;
+    const cleanArea = Math.max(1, parseFloat(area) || 40);
+    const cleanFloors = Math.max(1, Math.min(6, Math.round(parseFloat(floors) || 1)));
+    const cleanFH = Math.max(1.5, Math.min(14, parseFloat(floorHeight) || prog.DEFAULT_FLOOR_HEIGHT));
+    const locked = areaLocked !== false;
+    const id = 'custom-' + Date.now() + '-' + num;
+
+    const tpl = {
+      id,
+      ref: cleanRef,
+      name: cleanName,
+      short: cleanShort,
+      cat: 'CUSTOM',
+      customColor: customColor || '#8b7285',
+      isCustom: true,
+      area: cleanArea,
+      aspect: 1.4,
+      areaLocked: locked,
+      freeResize: !locked,
+      floors: cleanFloors,
+      floorHeight: cleanFH,
+      excludeFromNetTotal: false,
+      keywords: [],
+      links: [],
+      separations: [],
+      note: (note || '').trim()
+    };
+    state.customSpaces.push(tpl);
+
+    let px = planView.cam.cx;
+    let py = planView.cam.cy;
+    while (state.volumes.some(v => Math.hypot(v.x - px, v.y - py) < 2.2)) {
+      px += 3.5;
+      py -= 2.5;
+    }
+    const vol = createVolumeFromSpace(tpl, px, py);
+    state.volumes.push(vol);
+    state.selectedIds = [vol.id];
+    state.selectedItem = null;
+    refreshAll({ forceSidebar: true });
+    toast(`Created custom space "${cleanName}" (${cleanArea.toFixed(0)} m²)`);
+    return vol;
+  }
+
+  function deleteCustomSpace(id) {
+    pushUndo();
+    state.volumes = state.volumes.filter(v => v.id !== id);
+    state.customSpaces = state.customSpaces.filter(s => s.id !== id);
+    state.selectedIds = state.selectedIds.filter(x => x !== id);
+    refreshAll({ forceSidebar: true });
+    toast('Deleted custom bubble');
+  }
+
   function updateVolume(id, patch, opts = {}) {
     const vol = getVolume(id);
     if (!vol) return;
     if (!opts.silentUndo) pushUndo();
     Object.assign(vol, patch);
+    if (typeof patch.areaLocked === 'boolean') {
+      vol.freeResize = !patch.areaLocked;
+    } else if (typeof patch.freeResize === 'boolean') {
+      vol.areaLocked = !patch.freeResize;
+    }
+    syncCustomTemplateFromVolume(vol);
     refreshAll(opts);
   }
 
@@ -267,6 +394,7 @@
       if (vol) {
         const { id, ...rest } = u;
         Object.assign(vol, rest);
+        syncCustomTemplateFromVolume(vol);
       }
     }
     refreshAll(opts);
@@ -278,7 +406,7 @@
     const drop = new Set(ids);
     state.volumes = state.volumes.filter(v => !drop.has(v.id));
     state.selectedIds = state.selectedIds.filter(id => !drop.has(id));
-    refreshAll();
+    refreshAll({ forceSidebar: true });
   }
 
   function groupSelected() {
@@ -321,18 +449,20 @@
 
   function addDimension(view, p1, p2) {
     pushUndo();
-    state.dimensions.push({
+    const dim = {
       id: 'dim-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
       view,
       p1,
       p2
-    });
+    };
+    state.dimensions.push(dim);
     refreshAll();
+    return dim;
   }
 
   function addSectionDimension(planeId, s1, z1, s2, z2) {
     pushUndo();
-    state.dimensions.push({
+    const dim = {
       id: 'dim-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
       view: 'section',
       planeId,
@@ -340,8 +470,135 @@
       z1,
       s2,
       z2
-    });
+    };
+    state.dimensions.push(dim);
     refreshAll();
+    return dim;
+  }
+
+  function updateDimension(id, patch, opts = {}) {
+    const dim = state.dimensions.find(d => d.id === id);
+    if (!dim) return;
+    if (!opts.silentUndo) pushUndo();
+    Object.assign(dim, patch);
+    refreshAll(opts);
+  }
+
+  function deleteDimension(id) {
+    pushUndo();
+    state.dimensions = state.dimensions.filter(d => d.id !== id);
+    if (state.selectedItem && state.selectedItem.kind === 'dim' && state.selectedItem.id === id) {
+      state.selectedItem = null;
+    }
+    refreshAll({ forceSidebar: true });
+  }
+
+  function addAnnotation(ann) {
+    pushUndo();
+    state.layers.annotations = true;
+    const item = {
+      id: 'ann-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+      ...ann
+    };
+    state.annotations.push(item);
+    state.selectedIds = [];
+    state.selectedItem = { kind: item.type, id: item.id };
+    refreshAll({ forceSidebar: true });
+    return item;
+  }
+
+  function updateAnnotation(id, patch, opts = {}) {
+    const ann = state.annotations.find(a => a.id === id);
+    if (!ann) return;
+    if (!opts.silentUndo) pushUndo();
+    Object.assign(ann, patch);
+    refreshAll(opts);
+  }
+
+  function deleteAnnotation(id) {
+    pushUndo();
+    state.annotations = state.annotations.filter(a => a.id !== id);
+    if (state.selectedItem && state.selectedItem.id === id) {
+      state.selectedItem = null;
+    }
+    refreshAll({ forceSidebar: true });
+  }
+
+  let activeInlineCleanup = null;
+  function closeInlineTextEditor() {
+    if (activeInlineCleanup) {
+      activeInlineCleanup(true);
+      activeInlineCleanup = null;
+    }
+  }
+
+  function openInlineTextEditor({ view, planeId, clientX, clientY, worldPos, existingId, initialText }) {
+    closeInlineTextEditor();
+    const el = document.getElementById('inlineTextEditor');
+    if (!el) return;
+
+    const left = Math.max(8, Math.min(window.innerWidth - 200, clientX));
+    const top = Math.max(8, Math.min(window.innerHeight - 40, clientY - 14));
+    el.style.left = left + 'px';
+    el.style.top = top + 'px';
+    el.value = initialText || '';
+    el.style.display = 'block';
+    setTimeout(() => {
+      el.focus();
+      if (initialText) el.select();
+    }, 0);
+
+    let done = false;
+    const finish = (cancelled) => {
+      if (done) return;
+      done = true;
+      el.removeEventListener('keydown', onKey);
+      el.removeEventListener('blur', onBlur);
+      el.style.display = 'none';
+      activeInlineCleanup = null;
+      const val = el.value.trim();
+      if (!cancelled && val) {
+        if (existingId) {
+          updateAnnotation(existingId, { text: val }, { forceSidebar: true });
+        } else if (view === 'section') {
+          addAnnotation({
+            type: 'text',
+            view: 'section',
+            planeId: planeId || (getActivePlane() ? getActivePlane().id : 'sec-A'),
+            s: worldPos.s,
+            z: worldPos.z,
+            text: val,
+            fontSize: 12,
+            color: 'ink',
+            boxed: false
+          });
+        } else {
+          addAnnotation({
+            type: 'text',
+            view: 'plan',
+            x: worldPos.x,
+            y: worldPos.y,
+            text: val,
+            fontSize: 12,
+            color: 'ink',
+            boxed: false
+          });
+        }
+      }
+    };
+    const onKey = (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        finish(false);
+      } else if (ev.key === 'Escape') {
+        ev.preventDefault();
+        finish(true);
+      }
+    };
+    const onBlur = () => finish(false);
+    el.addEventListener('keydown', onKey);
+    el.addEventListener('blur', onBlur);
+    activeInlineCleanup = finish;
   }
 
   function placeStarterProgram() {
@@ -403,8 +660,10 @@
     pushUndo();
     state.volumes = [];
     state.selectedIds = [];
+    state.selectedItem = null;
     state.dimensions = [];
-    refreshAll();
+    state.annotations = [];
+    refreshAll({ forceSidebar: true });
     toast('Board cleared');
   }
 
@@ -420,12 +679,19 @@
     selectVolume,
     toggleSelect,
     setSelection,
+    selectItem,
     clearSelection,
     updateVolume,
     updateVolumesBatch,
     updateActivePlane,
     addDimension,
     addSectionDimension,
+    updateDimension,
+    deleteDimension,
+    addAnnotation,
+    updateAnnotation,
+    deleteAnnotation,
+    openInlineTextEditor,
     updateCursorReadout: (pt) => {
       const el = document.getElementById('cursorReadout');
       if (el && pt) {
@@ -447,8 +713,10 @@
     updateTopBarMetrics();
     renderProgramDock();
     renderSectionHud();
-    if (document.activeElement && document.activeElement.closest && document.activeElement.closest('#sidebarBody')) {
-      // Avoid stealing focus while dragging sliders/typing numbers inside sidebar
+    const ae = document.activeElement;
+    const editingSidebarInput = !opts.forceSidebar && ae && ae.closest && ae.closest('#sidebarBody') &&
+      (ae.tagName === 'TEXTAREA' || (ae.tagName === 'INPUT' && ae.type !== 'checkbox' && ae.type !== 'radio' && ae.type !== 'color'));
+    if (editingSidebarInput) {
       updateSidebarLiveValues();
     } else {
       renderSidebar();
@@ -505,6 +773,13 @@
     document.getElementById('btn3dClipToggle').classList.toggle('active', !!(activePlane && activePlane.enabled));
     document.getElementById('btn3dTranslucent').classList.toggle('active', !!state.layers.translucentTerrain);
 
+    const rectDimBtn = document.getElementById('btnToggleRectDims');
+    if (rectDimBtn) rectDimBtn.classList.toggle('active', !!state.layers.rectDims);
+    const planAnnBtn = document.getElementById('btnPlanAnnToggle');
+    if (planAnnBtn) planAnnBtn.classList.toggle('active', !!state.layers.annotations);
+    const secAnnBtn = document.getElementById('btnSecAnnToggle');
+    if (secAnnBtn) secAnnBtn.classList.toggle('active', !!state.layers.annotations);
+
     const isDark = state.theme === 'dark';
     document.body.dataset.theme = isDark ? 'dark' : 'light';
     const themeBtn = document.getElementById('btnTheme');
@@ -517,12 +792,12 @@
   function renderProgramDock() {
     const container = document.getElementById('dockChips');
     const activeKws = getActiveKeywordSet();
-    const placedIds = new Set(state.volumes.map(v => v.id));
 
     const focusVol = state.selectedIds.length > 0 ? getVolume(state.selectedIds[0]) : null;
-    const focusSpace = focusVol || (state.selectedIds.length ? catalogById.get(state.selectedIds[0]) : null);
+    const focusSpace = focusVol || (state.selectedIds.length ? getSpaceTemplate(state.selectedIds[0]) : null);
 
-    let items = catalog.map(sp => {
+    const allTemplates = [...catalog, ...state.customSpaces];
+    let items = allTemplates.map(sp => {
       const placed = getVolume(sp.id);
       const current = placed || sp;
       const rel = focusSpace && focusSpace.id !== sp.id
@@ -544,23 +819,24 @@
     container.innerHTML = '';
     for (const item of items) {
       const { sp, placed, current, relScore } = item;
-      const cat = prog.CATEGORIES[sp.cat];
+      const style = prog.getSpaceStyle(current);
       const isSelected = state.selectedIds.includes(sp.id);
 
       const chip = document.createElement('div');
       chip.className = 'space-chip' + (placed ? ' placed' : '') + (isSelected ? ' selected' : '');
       chip.draggable = true;
-      chip.title = `${sp.name} (${current.area} m²) — ${sp.note}`;
+      const titleNote = current.note || 'Custom space';
+      chip.title = `${current.name} (${current.area.toFixed(0)} m²) — ${titleNote}`;
 
       const relBadge = (focusSpace && focusSpace.id !== sp.id && relScore >= 0.12)
         ? `<span class="chip-rel">${Math.round(relScore * 100)}%</span>`
         : '';
 
       chip.innerHTML = `
-        <span class="chip-dot" style="background:${cat.color}"></span>
-        <span class="chip-ref">${sp.id}</span>
-        <span class="chip-name">${sp.short}</span>
-        <span class="chip-area">${current.area}m²</span>
+        <span class="chip-dot" style="background:${style.color}"></span>
+        <span class="chip-ref">${escapeHtml(current.ref || current.id)}</span>
+        <span class="chip-name">${escapeHtml(current.short || sp.short)}</span>
+        <span class="chip-area">${current.area.toFixed(0)}m²</span>
         ${relBadge}
       `;
 
@@ -621,7 +897,264 @@
     if (maxFEl) maxFEl.textContent = `${ew.maxFillHeight.toFixed(2)} m`;
   }
 
+  function renderSelectedDim(body, dim) {
+    const isSec = dim.view === 'section';
+    const dHoriz = isSec ? Math.abs(dim.s2 - dim.s1) : Math.hypot(dim.p2.x - dim.p1.x, dim.p2.y - dim.p1.y);
+    const dz = isSec ? (dim.z2 - dim.z1) : (dim.p2.z - dim.p1.z);
+    const totalDist = isSec ? Math.hypot(dHoriz, dz) : dHoriz;
+    const slope = dHoriz > 0.1 ? (Math.abs(dz) / dHoriz) * 100 : 0;
+
+    body.innerHTML = `
+      <div class="panel-section">
+        <div class="panel-title">
+          <span>Selected Dimension (${isSec ? 'Section' : dim.view.toUpperCase()})</span>
+        </div>
+        <div class="earth-box">
+          <div class="earth-stat"><div class="k">${isSec ? 'Section Dist' : 'Plan Dist'}</div><div class="v">${totalDist.toFixed(2)} m</div></div>
+          <div class="earth-stat"><div class="k">Slope · ΔZ</div><div class="v" style="font-size:11px;">${dz >= 0 ? '+' : ''}${dz.toFixed(2)}m (${slope.toFixed(0)}%)</div></div>
+        </div>
+        <div class="note-box">
+          Drag either circular endpoint handle on the canvas to adjust endpoints, or drag the dimension text box to reposition it.
+        </div>
+        <div class="row-between">
+          <button class="btn" id="btnDoneItemSel" style="flex:1">Done</button>
+          <button class="btn danger" id="btnDelSelectedDim">Delete</button>
+        </div>
+      </div>
+    `;
+    document.getElementById('btnDoneItemSel').addEventListener('click', clearSelection);
+    document.getElementById('btnDelSelectedDim').addEventListener('click', () => deleteDimension(dim.id));
+  }
+
+  function renderSelectedLine(body, ann) {
+    const caps = [
+      ['none', 'None'],
+      ['arrow', 'Arrow'],
+      ['open-arrow', 'Open Arrow'],
+      ['dot', 'Dot'],
+      ['tick', 'Tick / Slash']
+    ];
+    const capOpts = (val) => caps.map(([k, lbl]) => `<option value="${k}" ${(val || 'none') === k ? 'selected' : ''}>${lbl}</option>`).join('');
+    const currentCol = ann.color || 'ink';
+    const swatches = prog.ANNOTATION_SWATCHES.map(c => {
+      const bg = c === 'ink' ? 'var(--ink)' : c;
+      return `<button type="button" class="swatch-btn ${currentCol === c ? 'active' : ''}" data-anncol="${c}" style="background:${bg};" title="${c}"></button>`;
+    }).join('');
+
+    body.innerHTML = `
+      <div class="panel-section">
+        <div class="panel-title">
+          <span>Line / Arrow Annotation</span>
+          <span>${ann.view === 'section' ? 'Section' : 'Plan'}</span>
+        </div>
+        <div class="field-grid">
+          <div class="field">
+            <label>Start Endpoint</label>
+            <select id="selAnnStartCap">${capOpts(ann.startCap || 'none')}</select>
+          </div>
+          <div class="field">
+            <label>End Endpoint</label>
+            <select id="selAnnEndCap">${capOpts(ann.endCap || 'arrow')}</select>
+          </div>
+          <div class="field">
+            <label>Line Style</label>
+            <select id="selAnnStyle">
+              <option value="solid" ${!ann.dashed ? 'selected' : ''}>Solid</option>
+              <option value="dashed" ${ann.dashed ? 'selected' : ''}>Dashed</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Stroke Weight</label>
+            <select id="selAnnWeight">
+              <option value="1" ${(ann.strokeWidth || 1.5) === 1 ? 'selected' : ''}>Thin (1 px)</option>
+              <option value="1.5" ${(ann.strokeWidth || 1.5) === 1.5 ? 'selected' : ''}>Medium (1.5 px)</option>
+              <option value="2.5" ${(ann.strokeWidth || 1.5) === 2.5 ? 'selected' : ''}>Heavy (2.5 px)</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label>Color</label>
+          <div class="swatch-row">${swatches}</div>
+        </div>
+        <div class="note-box">Drag either endpoint handle on the canvas to move ends, or drag the line itself.</div>
+        <div class="row-between">
+          <button class="btn" id="btnSwapAnnEnds" style="flex:1">Swap Ends</button>
+          <button class="btn danger" id="btnDelSelectedAnn">Delete</button>
+        </div>
+      </div>
+    `;
+    document.getElementById('selAnnStartCap').addEventListener('change', (e) => {
+      updateAnnotation(ann.id, { startCap: e.target.value }, { forceSidebar: true });
+    });
+    document.getElementById('selAnnEndCap').addEventListener('change', (e) => {
+      updateAnnotation(ann.id, { endCap: e.target.value }, { forceSidebar: true });
+    });
+    document.getElementById('selAnnStyle').addEventListener('change', (e) => {
+      updateAnnotation(ann.id, { dashed: e.target.value === 'dashed' }, { forceSidebar: true });
+    });
+    document.getElementById('selAnnWeight').addEventListener('change', (e) => {
+      updateAnnotation(ann.id, { strokeWidth: parseFloat(e.target.value) || 1.5 }, { forceSidebar: true });
+    });
+    body.querySelectorAll('[data-anncol]').forEach(btn => {
+      btn.addEventListener('click', () => updateAnnotation(ann.id, { color: btn.dataset.anncol }, { forceSidebar: true }));
+    });
+    document.getElementById('btnSwapAnnEnds').addEventListener('click', () => {
+      updateAnnotation(ann.id, {
+        p1: { ...ann.p2 },
+        p2: { ...ann.p1 },
+        startCap: ann.endCap || 'arrow',
+        endCap: ann.startCap || 'none'
+      }, { forceSidebar: true });
+    });
+    document.getElementById('btnDelSelectedAnn').addEventListener('click', () => deleteAnnotation(ann.id));
+  }
+
+  function renderSelectedText(body, ann) {
+    const currentCol = ann.color || 'ink';
+    const swatches = prog.ANNOTATION_SWATCHES.map(c => {
+      const bg = c === 'ink' ? 'var(--ink)' : c;
+      return `<button type="button" class="swatch-btn ${currentCol === c ? 'active' : ''}" data-anncol="${c}" style="background:${bg};" title="${c}"></button>`;
+    }).join('');
+    const fs = ann.fontSize || 12;
+
+    body.innerHTML = `
+      <div class="panel-section">
+        <div class="panel-title">
+          <span>Text Annotation</span>
+          <span>${ann.view === 'section' ? 'Section' : 'Plan'}</span>
+        </div>
+        <div class="field">
+          <label>Label Text</label>
+          <input type="text" id="inAnnText" value="${escapeHtml(ann.text || '')}" />
+        </div>
+        <div class="field-grid">
+          <div class="field">
+            <label>Size (px)</label>
+            <select id="selAnnFontSize">
+              ${[10, 12, 14, 16, 20].map(sz => `<option value="${sz}" ${fs === sz ? 'selected' : ''}>${sz} px</option>`).join('')}
+            </select>
+          </div>
+          <div class="field">
+            <label>&nbsp;</label>
+            <label class="kw-check-row" style="border:1px solid var(--border);border-radius:4px;padding:3px 6px;background:var(--surface);">
+              <span class="kw-check-left"><input type="checkbox" id="chkAnnBoxed" ${ann.boxed ? 'checked' : ''} /><span>Box Frame</span></span>
+            </label>
+          </div>
+        </div>
+        <div class="field">
+          <label>Color</label>
+          <div class="swatch-row">${swatches}</div>
+        </div>
+        <div class="note-box">Drag on canvas to move, or double-click on canvas for quick inline edit.</div>
+        <div class="row-between">
+          <button class="btn" id="btnDoneTextSel" style="flex:1">Done</button>
+          <button class="btn danger" id="btnDelSelectedText">Delete</button>
+        </div>
+      </div>
+    `;
+    const inp = document.getElementById('inAnnText');
+    let textUndoPushed = false;
+    inp.addEventListener('input', (e) => {
+      if (!textUndoPushed) { pushUndo(); textUndoPushed = true; }
+      updateAnnotation(ann.id, { text: e.target.value }, { silentUndo: true });
+    });
+    inp.addEventListener('change', () => { refreshAll({ forceSidebar: true }); });
+    document.getElementById('selAnnFontSize').addEventListener('change', (e) => {
+      updateAnnotation(ann.id, { fontSize: parseInt(e.target.value, 10) || 12 }, { forceSidebar: true });
+    });
+    document.getElementById('chkAnnBoxed').addEventListener('change', (e) => {
+      updateAnnotation(ann.id, { boxed: e.target.checked }, { forceSidebar: true });
+    });
+    body.querySelectorAll('[data-anncol]').forEach(btn => {
+      btn.addEventListener('click', () => updateAnnotation(ann.id, { color: btn.dataset.anncol }, { forceSidebar: true }));
+    });
+    document.getElementById('btnDoneTextSel').addEventListener('click', clearSelection);
+    document.getElementById('btnDelSelectedText').addEventListener('click', () => deleteAnnotation(ann.id));
+  }
+
+  function renderSelectedSectionPlane(body, plane) {
+    body.innerHTML = `
+      <div class="panel-section">
+        <div class="panel-title">
+          <span>Section Plane ${escapeHtml(plane.name)}–${escapeHtml(plane.name)}'</span>
+          <span>Selected</span>
+        </div>
+        <label class="kw-check-row">
+          <span class="kw-check-left"><input type="checkbox" id="selSecClipEnabled" ${plane.enabled ? 'checked' : ''} /><span>Enable 3D Clipping Plane</span></span>
+        </label>
+        <div class="field">
+          <label>Angle: <span id="selSecAngleVal">${Math.round(plane.angleDeg)}°</span></label>
+          <input type="range" id="selSecAngle" min="-180" max="180" step="1" value="${Math.round(plane.angleDeg)}" />
+        </div>
+        <div class="row-between">
+          <button class="btn" id="selSecSlideBack" style="flex:1">Slide -2 m</button>
+          <button class="btn" id="selSecSlideFwd" style="flex:1">Slide +2 m</button>
+          <button class="btn" id="selSecFlip">Flip</button>
+        </div>
+        <div class="field-grid">
+          <div class="field"><label>Center X (m)</label><input type="number" id="selSecCx" step="1" value="${plane.cx.toFixed(1)}" /></div>
+          <div class="field"><label>Center Y (m)</label><input type="number" id="selSecCy" step="1" value="${plane.cy.toFixed(1)}" /></div>
+        </div>
+        <div class="field">
+          <label>Projection Depth (m)</label>
+          <input type="number" id="selSecDepth" step="2" min="2" max="80" value="${plane.projDepth || 18}" />
+        </div>
+        <div class="note-box">Drag the center handle, endpoints, or dashed line on Plan while selected. Click Done (or Esc / canvas) to send behind bubbles.</div>
+        <button class="btn" id="btnDoneSectionEdit">Done Editing Section</button>
+      </div>
+    `;
+    document.getElementById('selSecClipEnabled').addEventListener('change', (e) => {
+      updateActivePlane({ enabled: e.target.checked });
+    });
+    document.getElementById('selSecAngle').addEventListener('input', (e) => {
+      const lbl = document.getElementById('selSecAngleVal');
+      if (lbl) lbl.textContent = e.target.value + '°';
+      updateActivePlane({ angleDeg: parseFloat(e.target.value) });
+    });
+    document.getElementById('selSecSlideBack').addEventListener('click', () => {
+      const b = eng.getPlaneBasis(plane);
+      updateActivePlane({ cx: plane.cx - b.vx * 2, cy: plane.cy - b.vy * 2 });
+    });
+    document.getElementById('selSecSlideFwd').addEventListener('click', () => {
+      const b = eng.getPlaneBasis(plane);
+      updateActivePlane({ cx: plane.cx + b.vx * 2, cy: plane.cy + b.vy * 2 });
+    });
+    document.getElementById('selSecFlip').addEventListener('click', () => {
+      updateActivePlane({ flipped: !plane.flipped });
+    });
+    document.getElementById('selSecCx').addEventListener('change', (e) => {
+      updateActivePlane({ cx: parseFloat(e.target.value) || 0 });
+    });
+    document.getElementById('selSecCy').addEventListener('change', (e) => {
+      updateActivePlane({ cy: parseFloat(e.target.value) || 0 });
+    });
+    document.getElementById('selSecDepth').addEventListener('change', (e) => {
+      updateActivePlane({ projDepth: Math.max(2, parseFloat(e.target.value) || 18) });
+    });
+    document.getElementById('btnDoneSectionEdit').addEventListener('click', clearSelection);
+  }
+
   function renderTabSelected(body) {
+    if (state.selectedItem) {
+      if (state.selectedItem.kind === 'dim') {
+        const dim = state.dimensions.find(d => d.id === state.selectedItem.id);
+        if (dim) { renderSelectedDim(body, dim); return; }
+        state.selectedItem = null;
+      } else if (state.selectedItem.kind === 'line') {
+        const ann = state.annotations.find(a => a.id === state.selectedItem.id);
+        if (ann) { renderSelectedLine(body, ann); return; }
+        state.selectedItem = null;
+      } else if (state.selectedItem.kind === 'text') {
+        const ann = state.annotations.find(a => a.id === state.selectedItem.id);
+        if (ann) { renderSelectedText(body, ann); return; }
+        state.selectedItem = null;
+      } else if (state.selectedItem.kind === 'section') {
+        const plane = state.planes.find(p => p.id === state.selectedItem.id) || getActivePlane();
+        if (plane) { renderSelectedSectionPlane(body, plane); return; }
+        state.selectedItem = null;
+      }
+    }
+
     if (state.selectedIds.length === 0) {
       body.innerHTML = `
         <div class="panel-section">
@@ -633,7 +1166,7 @@
             <div class="earth-stat"><div class="k">Default Height</div><div class="v">${prog.DEFAULT_FLOOR_HEIGHT.toFixed(1)} m</div></div>
           </div>
           <div class="note-box">
-            Click any space chip in the Program Bar above (or drag onto Plan) to place a space volume. Click a placed bubble to inspect keyword relevance, stretch edges with exact area lock, adjust floors/height, or move in XYZ.
+            Click any space chip in the Program Bar above (or create a + Custom bubble) to place a space volume. Zoom in on Plan to view rectangle dimensions, or click section / dim labels to edit.
           </div>
           <div class="row-between">
             <button class="btn" id="sbStarterBtn" style="flex:1">Place Starter Program</button>
@@ -703,33 +1236,54 @@
     if (!vol) return;
     const dims = eng.getEffectiveDims(vol, state.useGross);
     const ew = eng.computeEarthwork(vol, state.useGross, 14);
-    const cat = prog.CATEGORIES[vol.cat];
-    const activeKws = getActiveKeywordSet();
+    const style = prog.getSpaceStyle(vol);
+    const locked = prog.isAreaLocked(vol);
 
     const sec = document.createElement('div');
     sec.className = 'panel-section';
+    const customIdentityHtml = vol.isCustom ? `
+      <div class="field">
+        <label>Name</label>
+        <input type="text" id="inCustomName" value="${escapeHtml(vol.name)}" />
+      </div>
+      <div class="field">
+        <label>Color</label>
+        <div class="row-between">
+          <div class="swatch-row" id="inCustomSwatches">
+            ${prog.CUSTOM_SWATCHES.map(hex => `<button type="button" class="swatch-btn ${style.color.toLowerCase() === hex ? 'active' : ''}" data-cswatch="${hex}" style="background:${hex};"></button>`).join('')}
+          </div>
+          <label class="color-picker-inline" title="Custom color">
+            <input type="color" id="inCustomColor" value="${style.color}" />
+          </label>
+        </div>
+      </div>
+    ` : `<div style="font-weight:600;font-size:12px;">${escapeHtml(vol.name)}</div>`;
+
     sec.innerHTML = `
       <div class="panel-title">
-        <span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${cat.color};margin-right:5px;"></span>${vol.id} · ${vol.short}</span>
-        <span>${vol.groupId ? 'Group ' + vol.groupId : 'Single'}</span>
+        <span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${style.color};margin-right:5px;"></span>${escapeHtml(vol.ref || vol.id)} · ${escapeHtml(vol.short)}</span>
+        <span>${vol.groupId ? 'Group ' + vol.groupId : (vol.isCustom ? 'Custom' : 'Single')}</span>
       </div>
-      <div style="font-weight:600;font-size:12px;">${vol.name}</div>
+      ${customIdentityHtml}
       <div class="field-grid">
         <div class="field">
-          <label>Total Area (m²)${vol.freeResize ? ' (Flex)' : ' (Locked)'}</label>
-          <input type="number" id="inArea" step="1" min="4" max="600" value="${vol.area.toFixed(1)}" ${vol.freeResize ? '' : 'disabled'} />
+          <label>Total Area (m²)</label>
+          <div class="row-between" style="gap:4px;">
+            <input type="number" id="inArea" step="1" min="1" max="5000" value="${vol.area.toFixed(1)}" style="flex:1;min-width:0;" />
+            <button type="button" class="lock-toggle-btn ${locked ? 'locked' : ''}" id="btnToggleAreaLock" title="Lock area to keep constant during resize">${locked ? 'Locked' : 'Flex'}</button>
+          </div>
         </div>
         <div class="field">
           <label>Floors (Area Split)</label>
-          <input type="number" id="inFloors" step="1" min="1" max="5" value="${dims.floors}" />
+          <input type="number" id="inFloors" step="1" min="1" max="6" value="${dims.floors}" />
         </div>
         <div class="field">
           <label>Width W (m)</label>
-          <input type="number" id="inW" step="0.1" min="1.5" value="${vol.w.toFixed(2)}" />
+          <input type="number" id="inW" step="0.1" min="0.5" value="${vol.w.toFixed(2)}" />
         </div>
         <div class="field">
           <label>Depth D (m)</label>
-          <input type="number" id="inD" step="0.1" min="1.5" value="${vol.d.toFixed(2)}" />
+          <input type="number" id="inD" step="0.1" min="0.5" value="${vol.d.toFixed(2)}" />
         </div>
         <div class="field">
           <label>Floor Height (m)</label>
@@ -776,7 +1330,7 @@
     `;
     body.appendChild(ewPanel);
 
-    // Keywords on this space
+    // Keywords & Description on this space
     const kwPanel = document.createElement('div');
     kwPanel.className = 'panel-section';
     const pillsHtml = state.keywords.map(k => {
@@ -788,8 +1342,11 @@
       .filter(k => !vol.keywords.includes(k.id))
       .map(k => `<option value="${k.id}">${k.label}</option>`)
       .join('');
+    const noteHtml = vol.isCustom
+      ? `<div class="field"><label>Description</label><textarea id="inCustomNote" rows="2" placeholder="Add space notes…">${escapeHtml(vol.note || '')}</textarea></div>`
+      : `<div class="note-box">${escapeHtml(vol.note || '')}</div>`;
     kwPanel.innerHTML = `
-      <div class="panel-title">Space Keywords</div>
+      <div class="panel-title">Keywords &amp; Description</div>
       <div class="row-wrap" id="spaceKwPills">${pillsHtml || '<span style="color:var(--ink-muted)">No keywords assigned</span>'}</div>
       <div class="row-between">
         <select id="selAddKwToSpace" style="flex:1;padding:4px;border:1px solid var(--border);border-radius:4px;background:var(--surface);">
@@ -797,59 +1354,103 @@
           ${availOptions}
         </select>
       </div>
-      <div class="note-box">${vol.note}</div>
-      <button class="btn danger" id="btnRemoveOne">Remove from Site</button>
+      ${noteHtml}
+      <div class="row-between">
+        <button class="btn danger" id="btnRemoveOne" style="flex:1">Remove from Site</button>
+        ${vol.isCustom ? '<button class="btn danger" id="btnDeleteCustom">Delete Custom</button>' : ''}
+      </div>
     `;
     body.appendChild(kwPanel);
 
-    // Bind numeric controls
-    if (vol.freeResize) {
-      document.getElementById('inArea').addEventListener('change', (e) => {
-        const newArea = Math.max(4, parseFloat(e.target.value) || vol.area);
-        const ratio = Math.sqrt(newArea / vol.area);
-        updateVolume(vol.id, { area: newArea, w: vol.w * ratio, d: vol.d * ratio });
+    // Custom Name / Color / Note listeners
+    if (vol.isCustom) {
+      const nameInp = document.getElementById('inCustomName');
+      let nameUndo = false;
+      nameInp.addEventListener('input', (e) => {
+        if (!nameUndo) { pushUndo(); nameUndo = true; }
+        const val = e.target.value;
+        const short = val.trim().length > 14 ? val.trim().slice(0, 13).trim() + '…' : (val.trim() || vol.ref);
+        updateVolume(vol.id, { name: val, short }, { silentUndo: true });
       });
+      nameInp.addEventListener('change', () => refreshAll({ forceSidebar: true }));
+
+      document.querySelectorAll('#inCustomSwatches [data-cswatch]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          updateVolume(vol.id, { customColor: btn.dataset.cswatch }, { forceSidebar: true });
+        });
+      });
+      document.getElementById('inCustomColor').addEventListener('change', (e) => {
+        updateVolume(vol.id, { customColor: e.target.value }, { forceSidebar: true });
+      });
+      const noteInp = document.getElementById('inCustomNote');
+      if (noteInp) {
+        let noteUndo = false;
+        noteInp.addEventListener('input', (e) => {
+          if (!noteUndo) { pushUndo(); noteUndo = true; }
+          updateVolume(vol.id, { note: e.target.value }, { silentUndo: true });
+        });
+      }
+      const delCustomBtn = document.getElementById('btnDeleteCustom');
+      if (delCustomBtn) {
+        delCustomBtn.addEventListener('click', () => deleteCustomSpace(vol.id));
+      }
     }
+
+    // Bind Area / Lock / Dimensions controls
+    document.getElementById('inArea').addEventListener('change', (e) => {
+      const newArea = Math.max(1, Math.min(5000, parseFloat(e.target.value) || vol.area));
+      const ratio = Math.sqrt(newArea / Math.max(0.1, vol.area));
+      updateVolume(vol.id, { area: newArea, w: vol.w * ratio, d: vol.d * ratio }, { forceSidebar: true });
+    });
+    document.getElementById('btnToggleAreaLock').addEventListener('click', () => {
+      const nextLocked = !prog.isAreaLocked(vol);
+      updateVolume(vol.id, { areaLocked: nextLocked, freeResize: !nextLocked }, { forceSidebar: true });
+      toast(nextLocked ? `Area locked at ${vol.area.toFixed(1)} m²` : 'Area unlocked for free resize');
+    });
     document.getElementById('inFloors').addEventListener('change', (e) => {
       const f = Math.max(1, Math.min(6, Math.round(parseFloat(e.target.value) || 1)));
       const fpArea = vol.area / f;
-      const ratio = vol.w / vol.d;
+      const ratio = vol.w / Math.max(0.2, vol.d);
       const nw = Math.sqrt(fpArea * ratio);
       const nd = fpArea / nw;
-      updateVolume(vol.id, { floors: f, w: nw, d: nd });
+      updateVolume(vol.id, { floors: f, w: nw, d: nd }, { forceSidebar: true });
     });
     document.getElementById('inW').addEventListener('change', (e) => {
       const fpArea = vol.area / Math.max(1, vol.floors || 1);
-      const nw = Math.max(1.5, Math.min(vol.freeResize ? 200 : fpArea / 1.5, parseFloat(e.target.value) || vol.w));
-      if (vol.freeResize) {
-        updateVolume(vol.id, { w: nw, area: Math.round(nw * vol.d * Math.max(1, vol.floors || 1) * 10) / 10 });
+      const isLocked = prog.isAreaLocked(vol);
+      const minSide = Math.min(1.5, Math.max(0.5, Math.sqrt(fpArea) * 0.5));
+      const nw = Math.max(minSide, Math.min(isLocked ? fpArea / minSide : 200, parseFloat(e.target.value) || vol.w));
+      if (isLocked) {
+        updateVolume(vol.id, { w: nw, d: fpArea / nw }, { forceSidebar: true });
       } else {
-        updateVolume(vol.id, { w: nw, d: fpArea / nw });
+        updateVolume(vol.id, { w: nw, area: Math.round(nw * vol.d * Math.max(1, vol.floors || 1) * 10) / 10 }, { forceSidebar: true });
       }
     });
     document.getElementById('inD').addEventListener('change', (e) => {
       const fpArea = vol.area / Math.max(1, vol.floors || 1);
-      const nd = Math.max(1.5, Math.min(vol.freeResize ? 200 : fpArea / 1.5, parseFloat(e.target.value) || vol.d));
-      if (vol.freeResize) {
-        updateVolume(vol.id, { d: nd, area: Math.round(vol.w * nd * Math.max(1, vol.floors || 1) * 10) / 10 });
+      const isLocked = prog.isAreaLocked(vol);
+      const minSide = Math.min(1.5, Math.max(0.5, Math.sqrt(fpArea) * 0.5));
+      const nd = Math.max(minSide, Math.min(isLocked ? fpArea / minSide : 200, parseFloat(e.target.value) || vol.d));
+      if (isLocked) {
+        updateVolume(vol.id, { d: nd, w: fpArea / nd }, { forceSidebar: true });
       } else {
-        updateVolume(vol.id, { d: nd, w: fpArea / nd });
+        updateVolume(vol.id, { d: nd, area: Math.round(vol.w * nd * Math.max(1, vol.floors || 1) * 10) / 10 }, { forceSidebar: true });
       }
     });
     document.getElementById('inFloorH').addEventListener('change', (e) => {
       const fh = Math.max(1.5, Math.min(14, parseFloat(e.target.value) || 3.0));
-      updateVolume(vol.id, { floorHeight: fh });
+      updateVolume(vol.id, { floorHeight: fh }, { forceSidebar: true });
     });
     document.getElementById('inRot').addEventListener('change', (e) => {
       const deg = parseFloat(e.target.value) || 0;
-      updateVolume(vol.id, { rot: deg * Math.PI / 180 });
+      updateVolume(vol.id, { rot: deg * Math.PI / 180 }, { forceSidebar: true });
     });
     document.getElementById('inZBase').addEventListener('change', (e) => {
       const zb = parseFloat(e.target.value);
-      if (!Number.isNaN(zb)) updateVolume(vol.id, { zBase: zb });
+      if (!Number.isNaN(zb)) updateVolume(vol.id, { zBase: zb }, { forceSidebar: true });
     });
     document.getElementById('btnSnapZ').addEventListener('click', () => {
-      updateVolume(vol.id, { zBase: Math.round(eng.getGroundZ(vol.x, vol.y) * 100) / 100 });
+      updateVolume(vol.id, { zBase: Math.round(eng.getGroundZ(vol.x, vol.y) * 100) / 100 }, { forceSidebar: true });
     });
     document.getElementById('btnStackOnBelow').addEventListener('click', () => {
       const others = state.volumes.filter(v => v.id !== vol.id && eng.minEdgeDistanceRects(vol, v, state.useGross) === 0);
@@ -860,7 +1461,7 @@
       others.sort((a, b) => (b.zBase + eng.getEffectiveDims(b, state.useGross).totalHeight) - (a.zBase + eng.getEffectiveDims(a, state.useGross).totalHeight));
       const base = others[0];
       const topZ = base.zBase + eng.getEffectiveDims(base, state.useGross).totalHeight;
-      updateVolume(vol.id, { zBase: Math.round(topZ * 100) / 100, zOrder: state.nextZOrder++ });
+      updateVolume(vol.id, { zBase: Math.round(topZ * 100) / 100, zOrder: state.nextZOrder++ }, { forceSidebar: true });
       toast(`Stacked on top of ${base.ref} (${topZ.toFixed(1)} m)`);
     });
     document.getElementById('btnZFront').addEventListener('click', () => {
@@ -876,14 +1477,14 @@
     document.querySelectorAll('#spaceKwPills .kw-pill').forEach(pill => {
       pill.addEventListener('click', () => {
         const kw = pill.dataset.kw;
-        updateVolume(vol.id, { keywords: vol.keywords.filter(k => k !== kw) });
+        updateVolume(vol.id, { keywords: vol.keywords.filter(k => k !== kw) }, { forceSidebar: true });
       });
     });
     document.getElementById('selAddKwToSpace').addEventListener('change', (e) => {
       const kw = e.target.value;
       if (!kw) return;
       if (!vol.keywords.includes(kw)) {
-        updateVolume(vol.id, { keywords: [...vol.keywords, kw] });
+        updateVolume(vol.id, { keywords: [...vol.keywords, kw] }, { forceSidebar: true });
       }
     });
     document.getElementById('btnRemoveOne').addEventListener('click', () => removeVolumes([vol.id]));
@@ -1020,6 +1621,8 @@
       ['plotBuildings', 'Existing Buildings Inside Plot'],
       ['trees', 'Site Vegetation (Trees)'],
       ['cutFill', 'Cut & Fill Soil Volumes'],
+      ['rectDims', 'Rectangle Dimensions (Zoomed)'],
+      ['annotations', 'Annotations (Text & Lines)'],
       ['translucentTerrain', 'Translucent Terrain (3D)']
     ];
     layerPanel.innerHTML = `<div class="panel-title">Site &amp; Model Layers</div>` +
@@ -1131,11 +1734,16 @@
         `;
         row.querySelector('[data-load]').addEventListener('click', () => {
           pushUndo();
-          state.volumes = JSON.parse(JSON.stringify(it.volumes));
-          state.planes = JSON.parse(JSON.stringify(it.planes));
+          state.volumes = JSON.parse(JSON.stringify(it.volumes || [])).map(normalizeVolume);
+          state.planes = JSON.parse(JSON.stringify(it.planes || [createDefaultPlane()]));
+          state.annotations = JSON.parse(JSON.stringify(it.annotations || []));
+          if (Array.isArray(it.customSpaces)) {
+            state.customSpaces = JSON.parse(JSON.stringify(it.customSpaces)).map(normalizeVolume);
+          }
           state.activePlaneId = it.activePlaneId || state.planes[0].id;
           state.selectedIds = [];
-          refreshAll();
+          state.selectedItem = null;
+          refreshAll({ forceSidebar: true });
           toast(`Loaded "${it.name}"`);
         });
         row.querySelector('[data-del]').addEventListener('click', () => {
@@ -1170,6 +1778,8 @@
       fill,
       volumes: JSON.parse(JSON.stringify(state.volumes)),
       planes: JSON.parse(JSON.stringify(state.planes)),
+      annotations: JSON.parse(JSON.stringify(state.annotations)),
+      customSpaces: JSON.parse(JSON.stringify(state.customSpaces)),
       activePlaneId: state.activePlaneId
     });
     refreshAll();
@@ -1259,8 +1869,7 @@
 
   document.querySelectorAll('#toolSwitch .seg-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      state.tool = btn.dataset.tool;
-      refreshAll();
+      setTool(btn.dataset.tool);
     });
   });
 
@@ -1288,7 +1897,8 @@
     if (!state.dimensions.length) return;
     pushUndo();
     state.dimensions = [];
-    refreshAll();
+    if (state.selectedItem && state.selectedItem.kind === 'dim') state.selectedItem = null;
+    refreshAll({ forceSidebar: true });
     toast('Cleared dimensions');
   });
   document.getElementById('btnUndo').addEventListener('click', undo);
@@ -1309,6 +1919,19 @@
     refreshAll();
     setTimeout(handleResize, 20);
   });
+
+  document.getElementById('btnToggleRectDims').addEventListener('click', () => {
+    state.layers.rectDims = !state.layers.rectDims;
+    refreshAll();
+    toast(state.layers.rectDims ? 'Rectangle Dimensions ON' : 'Rectangle Dimensions OFF');
+  });
+  function toggleAnnotationsLayer() {
+    state.layers.annotations = !state.layers.annotations;
+    refreshAll();
+    toast(state.layers.annotations ? 'Annotations ON' : 'Annotations OFF');
+  }
+  document.getElementById('btnPlanAnnToggle').addEventListener('click', toggleAnnotationsLayer);
+  document.getElementById('btnSecAnnToggle').addEventListener('click', toggleAnnotationsLayer);
 
   document.getElementById('btnPlanFit').addEventListener('click', () => planView.fitSite());
   document.getElementById('btn3dFit').addEventListener('click', () => view3D.fitSite());
@@ -1332,19 +1955,77 @@
     refreshAll();
   });
 
-  // Centered Project / Export & Shortcuts Modals
+  // Centered Project / Export, Shortcuts & Custom Bubble Modals
   const projectModal = document.getElementById('projectModal');
   const shortcutsModal = document.getElementById('shortcutsModal');
-  function openProjectModal() { shortcutsModal.classList.remove('open'); projectModal.classList.add('open'); }
-  function closeProjectModal() { projectModal.classList.remove('open'); }
-  function toggleShortcutsModal() {
-    projectModal.classList.remove('open');
-    shortcutsModal.classList.toggle('open');
+  const customBubbleModal = document.getElementById('customBubbleModal');
+  const cbColorInput = document.getElementById('cbColor');
+  const cbColorHex = document.getElementById('cbColorHex');
+  const cbSwatches = document.getElementById('cbSwatches');
+
+  function syncCbSwatches(hex) {
+    cbColorInput.value = hex;
+    cbColorHex.textContent = hex;
+    cbSwatches.querySelectorAll('.swatch-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.swatch.toLowerCase() === hex.toLowerCase());
+    });
   }
+  if (cbSwatches) {
+    cbSwatches.innerHTML = prog.CUSTOM_SWATCHES.map(hex =>
+      `<button type="button" class="swatch-btn" data-swatch="${hex}" style="background:${hex};" title="${hex}"></button>`
+    ).join('');
+    cbSwatches.querySelectorAll('.swatch-btn').forEach(b => {
+      b.addEventListener('click', () => syncCbSwatches(b.dataset.swatch));
+    });
+    cbColorInput.addEventListener('input', (e) => syncCbSwatches(e.target.value));
+  }
+
   function closeAllModals() {
     projectModal.classList.remove('open');
     shortcutsModal.classList.remove('open');
+    customBubbleModal.classList.remove('open');
   }
+  function openProjectModal() { closeAllModals(); projectModal.classList.add('open'); }
+  function closeProjectModal() { projectModal.classList.remove('open'); }
+  function toggleShortcutsModal() {
+    const wasOpen = shortcutsModal.classList.contains('open');
+    closeAllModals();
+    if (!wasOpen) shortcutsModal.classList.add('open');
+  }
+  function openCustomBubbleModal() {
+    closeAllModals();
+    document.getElementById('cbName').value = '';
+    document.getElementById('cbRef').value = 'U' + state.nextCustomNum;
+    document.getElementById('cbDesc').value = '';
+    document.getElementById('cbArea').value = '40';
+    document.getElementById('cbAreaLocked').checked = true;
+    document.getElementById('cbFloors').value = '1';
+    document.getElementById('cbFloorH').value = String(prog.DEFAULT_FLOOR_HEIGHT);
+    syncCbSwatches(prog.CUSTOM_SWATCHES[(state.nextCustomNum - 1) % prog.CUSTOM_SWATCHES.length]);
+    customBubbleModal.classList.add('open');
+    setTimeout(() => document.getElementById('cbName').focus(), 20);
+  }
+  function closeCustomBubbleModal() { customBubbleModal.classList.remove('open'); }
+
+  document.getElementById('btnAddCustomBubble').addEventListener('click', openCustomBubbleModal);
+  document.getElementById('btnCloseCustomModal').addEventListener('click', closeCustomBubbleModal);
+  document.getElementById('btnCancelCustomModal').addEventListener('click', closeCustomBubbleModal);
+  customBubbleModal.addEventListener('click', (e) => {
+    if (e.target === customBubbleModal) closeCustomBubbleModal();
+  });
+  document.getElementById('customBubbleForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const name = document.getElementById('cbName').value;
+    const ref = document.getElementById('cbRef').value;
+    const note = document.getElementById('cbDesc').value;
+    const customColor = cbColorInput.value;
+    const area = parseFloat(document.getElementById('cbArea').value) || 40;
+    const areaLocked = document.getElementById('cbAreaLocked').checked;
+    const floors = parseInt(document.getElementById('cbFloors').value, 10) || 1;
+    const floorHeight = parseFloat(document.getElementById('cbFloorH').value) || prog.DEFAULT_FLOOR_HEIGHT;
+    closeCustomBubbleModal();
+    createCustomBubble({ name, ref, note, customColor, area, areaLocked, floors, floorHeight });
+  });
 
   document.getElementById('btnExportMenu').addEventListener('click', openProjectModal);
   document.getElementById('btnCloseProjectModal').addEventListener('click', closeProjectModal);
@@ -1402,12 +2083,21 @@
   document.getElementById('actClearBoard').addEventListener('click', () => { closeProjectModal(); clearBoard(); });
 
   function setTool(toolName) {
+    closeInlineTextEditor();
     state.tool = toolName;
     planView.dimDraft = null;
+    planView.lineDraft = null;
     view3D.dimDraft = null;
     sectionView.dimDraft = null;
+    sectionView.lineDraft = null;
     refreshAll();
-    const names = { select: 'Select tool (V)', dimension: 'Dimension tool (D)', section: 'Section Plane tool (C)' };
+    const names = {
+      select: 'Select tool (V)',
+      dimension: 'Dimension tool (D)',
+      line: 'Line / Arrow tool (L)',
+      text: 'Text Annotation tool (A)',
+      section: 'Section Plane tool (C)'
+    };
     toast(names[toolName] || toolName);
   }
 
@@ -1419,7 +2109,7 @@
 
   // Keyboard shortcuts
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && (projectModal.classList.contains('open') || shortcutsModal.classList.contains('open'))) {
+    if (e.key === 'Escape' && (projectModal.classList.contains('open') || shortcutsModal.classList.contains('open') || customBubbleModal.classList.contains('open'))) {
       closeAllModals();
       return;
     }
@@ -1455,6 +2145,13 @@
 
     if (k === 'v') { setTool('select'); }
     else if (k === 'd') { setTool('dimension'); }
+    else if (k === 'l') { setTool('line'); }
+    else if (k === 'a') { setTool('text'); }
+    else if (k === 'r') {
+      state.layers.rectDims = !state.layers.rectDims;
+      refreshAll();
+      toast(state.layers.rectDims ? 'Rectangle Dimensions ON' : 'Rectangle Dimensions OFF');
+    }
     else if (k === 'c' && e.shiftKey) {
       const p = getActivePlane();
       if (p) {
@@ -1520,8 +2217,14 @@
       if (state.selectedIds.length) {
         e.preventDefault();
         removeVolumes(state.selectedIds);
+      } else if (state.selectedItem) {
+        e.preventDefault();
+        if (state.selectedItem.kind === 'dim') deleteDimension(state.selectedItem.id);
+        else if (state.selectedItem.kind === 'line' || state.selectedItem.kind === 'text') deleteAnnotation(state.selectedItem.id);
+        else if (state.selectedItem.kind === 'section') clearSelection();
       }
     } else if (e.key === 'Escape') {
+      if (state.selectedItem) clearSelection();
       setTool('select');
     }
   });

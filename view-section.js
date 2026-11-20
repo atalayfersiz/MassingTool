@@ -15,6 +15,9 @@
 
       this.dragState = null;
       this.dimDraft = null;
+      this.lineDraft = null;
+      this.dimHitBoxes = [];
+      this.annHitBoxes = [];
       this.hoverItem = null;
       this.spaceHeld = false;
       this.lastSlices = [];
@@ -72,7 +75,8 @@
 
     _bindEvents() {
       window.addEventListener('keydown', (e) => {
-        if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT') {
+        const tag = document.activeElement ? document.activeElement.tagName : '';
+        if (e.code === 'Space' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(tag)) {
           this.spaceHeld = true;
         }
       });
@@ -94,10 +98,29 @@
         this.render();
       }, { passive: false });
 
+      this.canvas.addEventListener('dblclick', (e) => {
+        const pos = this._getPointerPos(e);
+        const state = this.api.getState();
+        if (!state.layers.annotations) return;
+        const annHit = this._hitTestAnnotations(pos.x, pos.y);
+        if (annHit && annHit.kind === 'text') {
+          this.api.openInlineTextEditor({
+            view: 'section',
+            planeId: annHit.ann.planeId,
+            clientX: e.clientX,
+            clientY: e.clientY,
+            existingId: annHit.ann.id,
+            initialText: annHit.ann.text
+          });
+        }
+      });
+
       this.canvas.addEventListener('pointerdown', (e) => {
         const pos = this._getPointerPos(e);
         const sec = this.screenToSec(pos.x, pos.y);
         const state = this.api.getState();
+        const plane = this.api.getActivePlane();
+        const planeId = plane ? plane.id : 'sec-A';
 
         if (e.button === 1 || e.button === 2 || (e.button === 0 && this.spaceHeld)) {
           this.dragState = {
@@ -115,19 +138,131 @@
 
         // Dimension tool
         if (state.tool === 'dimension') {
-          const plane = this.api.getActivePlane();
-          const planeId = plane ? plane.id : 'sec-A';
           if (!this.dimDraft) {
             this.dimDraft = { planeId, s1: sec.s, z1: sec.z, s2: sec.s, z2: sec.z };
           } else {
-            this.api.addSectionDimension(planeId, this.dimDraft.s1, this.dimDraft.z1, sec.s, sec.z);
+            const dim = this.api.addSectionDimension(planeId, this.dimDraft.s1, this.dimDraft.z1, sec.s, sec.z);
             this.dimDraft = null;
+            if (dim) this.api.selectItem('dim', dim.id);
           }
           this.render();
           return;
         }
 
-        // Check top-edge height handles first
+        // Line / Arrow annotation tool
+        if (state.tool === 'line') {
+          if (!this.lineDraft) {
+            this.lineDraft = {
+              planeId,
+              p1: { s: sec.s, z: sec.z },
+              p2: { s: sec.s, z: sec.z },
+              startPos: pos,
+              moved: false
+            };
+            this.dragState = { type: 'line-draw' };
+            this.canvas.setPointerCapture(e.pointerId);
+          } else {
+            const p2 = this._snapAngleSec(this.lineDraft.p1, sec, e.shiftKey);
+            if (Math.hypot(p2.s - this.lineDraft.p1.s, p2.z - this.lineDraft.p1.z) > 0.2) {
+              this.api.addAnnotation({
+                type: 'line',
+                view: 'section',
+                planeId,
+                p1: { ...this.lineDraft.p1 },
+                p2,
+                startCap: 'none',
+                endCap: 'arrow',
+                dashed: false,
+                strokeWidth: 1.5,
+                color: 'ink'
+              });
+            }
+            this.lineDraft = null;
+          }
+          this.render();
+          return;
+        }
+
+        // Text annotation tool
+        if (state.tool === 'text') {
+          this.api.openInlineTextEditor({
+            view: 'section',
+            planeId,
+            clientX: e.clientX,
+            clientY: e.clientY,
+            worldPos: { s: sec.s, z: sec.z }
+          });
+          return;
+        }
+
+        // 1. Selected dimension endpoint handle
+        const dimEpHit = this._hitTestSelectedDimEndpoint(pos.x, pos.y);
+        if (dimEpHit) {
+          this.api.pushUndo();
+          this.dragState = {
+            type: 'dim-endpoint',
+            dimId: dimEpHit.dim.id,
+            endKey: dimEpHit.endpoint
+          };
+          this.canvas.setPointerCapture(e.pointerId);
+          return;
+        }
+
+        // 2. Selected line annotation endpoint handle
+        const lineEpHit = this._hitTestSelectedLineEndpoint(pos.x, pos.y);
+        if (lineEpHit) {
+          this.api.pushUndo();
+          this.dragState = {
+            type: 'line-endpoint',
+            annId: lineEpHit.ann.id,
+            endpoint: lineEpHit.endpoint
+          };
+          this.canvas.setPointerCapture(e.pointerId);
+          return;
+        }
+
+        // 3. Dimension text box click/drag
+        const dimBoxHit = this._hitTestDimTextBox(pos.x, pos.y);
+        if (dimBoxHit) {
+          const dim = state.dimensions.find(d => d.id === dimBoxHit.id);
+          if (dim) {
+            this.api.selectItem('dim', dim.id);
+            this.api.pushUndo();
+            this.dragState = {
+              type: 'dim-move',
+              dimId: dim.id,
+              startSec: sec,
+              orig: { s1: dim.s1, z1: dim.z1, s2: dim.s2, z2: dim.z2 }
+            };
+            this.canvas.setPointerCapture(e.pointerId);
+            this.render();
+            return;
+          }
+        }
+
+        // 4. Annotations (Text & Line/Arrow)
+        if (state.layers.annotations) {
+          const annHit = this._hitTestAnnotations(pos.x, pos.y);
+          if (annHit) {
+            const ann = annHit.ann;
+            this.api.selectItem(ann.type, ann.id);
+            this.api.pushUndo();
+            this.dragState = {
+              type: 'ann-move',
+              annId: ann.id,
+              kind: ann.type,
+              startSec: sec,
+              orig: ann.type === 'text'
+                ? { s: ann.s, z: ann.z }
+                : { p1: { ...ann.p1 }, p2: { ...ann.p2 } }
+            };
+            this.canvas.setPointerCapture(e.pointerId);
+            this.render();
+            return;
+          }
+        }
+
+        // 5. Top-edge height handles & volume slices
         const hit = this._hitTestSlice(pos.x, pos.y, sec);
         if (hit) {
           const vol = hit.slice.vol;
@@ -189,12 +324,21 @@
             this.render();
             return;
           }
+          if (state.tool === 'line' && this.lineDraft) {
+            this.lineDraft.p2 = this._snapAngleSec(this.lineDraft.p1, sec, e.shiftKey);
+            this.render();
+            return;
+          }
           const hit = this._hitTestSlice(pos.x, pos.y, sec);
           this.hoverItem = hit ? { id: hit.slice.vol.id, mode: hit.mode } : null;
-          if (state.tool === 'dimension') this.canvas.style.cursor = 'crosshair';
+          if (this.spaceHeld) this.canvas.style.cursor = 'grab';
+          else if (state.tool === 'text') this.canvas.style.cursor = 'text';
+          else if (state.tool === 'dimension' || state.tool === 'line') this.canvas.style.cursor = 'crosshair';
+          else if (this._hitTestSelectedDimEndpoint(pos.x, pos.y) || this._hitTestSelectedLineEndpoint(pos.x, pos.y) || this._hitTestDimTextBox(pos.x, pos.y)) this.canvas.style.cursor = 'pointer';
+          else if (state.layers.annotations && this._hitTestAnnotations(pos.x, pos.y)) this.canvas.style.cursor = 'move';
           else if (hit && hit.mode === 'height') this.canvas.style.cursor = 'ns-resize';
           else if (hit) this.canvas.style.cursor = 'move';
-          else this.canvas.style.cursor = this.spaceHeld ? 'grab' : 'default';
+          else this.canvas.style.cursor = 'default';
           return;
         }
 
@@ -204,6 +348,67 @@
           this.cam.cs = this.dragState.origCs - dx;
           this.cam.cz = this.dragState.origCz + dy;
           this.render();
+          return;
+        }
+
+        if (this.dragState.type === 'line-draw' && this.lineDraft) {
+          if (Math.hypot(pos.x - this.lineDraft.startPos.x, pos.y - this.lineDraft.startPos.y) > 4) {
+            this.lineDraft.moved = true;
+          }
+          this.lineDraft.p2 = this._snapAngleSec(this.lineDraft.p1, sec, e.shiftKey);
+          this.render();
+          return;
+        }
+
+        if (this.dragState.type === 'dim-endpoint') {
+          const dim = state.dimensions.find(d => d.id === this.dragState.dimId);
+          if (!dim) return;
+          const other = this.dragState.endKey === '1'
+            ? { s: dim.s2, z: dim.z2 }
+            : { s: dim.s1, z: dim.z1 };
+          const snapped = this._snapAngleSec(other, sec, e.shiftKey);
+          if (this.dragState.endKey === '1') {
+            this.api.updateDimension(dim.id, { s1: snapped.s, z1: snapped.z }, { silentUndo: true });
+          } else {
+            this.api.updateDimension(dim.id, { s2: snapped.s, z2: snapped.z }, { silentUndo: true });
+          }
+          return;
+        }
+
+        if (this.dragState.type === 'dim-move') {
+          const ds = sec.s - this.dragState.startSec.s;
+          const dz = sec.z - this.dragState.startSec.z;
+          const o = this.dragState.orig;
+          this.api.updateDimension(this.dragState.dimId, {
+            s1: o.s1 + ds, z1: o.z1 + dz,
+            s2: o.s2 + ds, z2: o.z2 + dz
+          }, { silentUndo: true });
+          return;
+        }
+
+        if (this.dragState.type === 'line-endpoint') {
+          const ann = state.annotations.find(a => a.id === this.dragState.annId);
+          if (!ann) return;
+          const other = this.dragState.endpoint === 'p1' ? ann.p2 : ann.p1;
+          const snapped = this._snapAngleSec(other, sec, e.shiftKey);
+          this.api.updateAnnotation(ann.id, { [this.dragState.endpoint]: snapped }, { silentUndo: true });
+          return;
+        }
+
+        if (this.dragState.type === 'ann-move') {
+          const ds = sec.s - this.dragState.startSec.s;
+          const dz = sec.z - this.dragState.startSec.z;
+          if (this.dragState.kind === 'text') {
+            this.api.updateAnnotation(this.dragState.annId, {
+              s: this.dragState.orig.s + ds,
+              z: this.dragState.orig.z + dz
+            }, { silentUndo: true });
+          } else {
+            this.api.updateAnnotation(this.dragState.annId, {
+              p1: { s: this.dragState.orig.p1.s + ds, z: this.dragState.orig.p1.z + dz },
+              p2: { s: this.dragState.orig.p2.s + ds, z: this.dragState.orig.p2.z + dz }
+            }, { silentUndo: true });
+          }
           return;
         }
 
@@ -237,10 +442,104 @@
 
       this.canvas.addEventListener('pointerup', (e) => {
         if (!this.dragState) return;
+        if (this.dragState.type === 'line-draw' && this.lineDraft && this.lineDraft.moved) {
+          const p2 = this.lineDraft.p2;
+          if (Math.hypot(p2.s - this.lineDraft.p1.s, p2.z - this.lineDraft.p1.z) > 0.2) {
+            this.api.addAnnotation({
+              type: 'line',
+              view: 'section',
+              planeId: this.lineDraft.planeId,
+              p1: { ...this.lineDraft.p1 },
+              p2: { ...p2 },
+              startCap: 'none',
+              endCap: 'arrow',
+              dashed: false,
+              strokeWidth: 1.5,
+              color: 'ink'
+            });
+          }
+          this.lineDraft = null;
+        }
         try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) {}
         this.dragState = null;
         this.render();
       });
+    }
+
+    _snapAngleSec(origin, target, shiftKey) {
+      if (!shiftKey || !origin) return { s: target.s, z: target.z };
+      const ds = target.s - origin.s;
+      const dz = target.z - origin.z;
+      const dist = Math.hypot(ds, dz);
+      if (dist < 1e-6) return { s: target.s, z: target.z };
+      const step = Math.PI / 12;
+      const ang = Math.round(Math.atan2(dz, ds) / step) * step;
+      return { s: origin.s + Math.cos(ang) * dist, z: origin.z + Math.sin(ang) * dist };
+    }
+
+    _distPointToSegment(px, py, ax, ay, bx, by) {
+      const dx = bx - ax, dy = by - ay;
+      const len2 = dx * dx + dy * dy;
+      if (len2 < 1e-6) return Math.hypot(px - ax, py - ay);
+      const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len2));
+      return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+    }
+
+    _hitTestSelectedDimEndpoint(sx, sy) {
+      const state = this.api.getState();
+      const plane = this.api.getActivePlane();
+      if (!plane || !state.selectedItem || state.selectedItem.kind !== 'dim') return null;
+      const dim = state.dimensions.find(d => d.id === state.selectedItem.id && d.view === 'section' && d.planeId === plane.id);
+      if (!dim) return null;
+      const p1 = this.secToScreen(dim.s1, dim.z1);
+      const p2 = this.secToScreen(dim.s2, dim.z2);
+      if (Math.hypot(sx - p1.x, sy - p1.y) <= 9) return { dim, endpoint: '1' };
+      if (Math.hypot(sx - p2.x, sy - p2.y) <= 9) return { dim, endpoint: '2' };
+      return null;
+    }
+
+    _hitTestDimTextBox(sx, sy) {
+      for (let i = this.dimHitBoxes.length - 1; i >= 0; i--) {
+        const b = this.dimHitBoxes[i];
+        if (sx >= b.x && sx <= b.x + b.w && sy >= b.y && sy <= b.y + b.h) return b;
+      }
+      return null;
+    }
+
+    _hitTestSelectedLineEndpoint(sx, sy) {
+      const state = this.api.getState();
+      const plane = this.api.getActivePlane();
+      if (!plane || !state.layers.annotations || !state.selectedItem || state.selectedItem.kind !== 'line') return null;
+      const ann = state.annotations.find(a => a.id === state.selectedItem.id && a.view === 'section' && a.planeId === plane.id);
+      if (!ann) return null;
+      const p1 = this.secToScreen(ann.p1.s, ann.p1.z);
+      const p2 = this.secToScreen(ann.p2.s, ann.p2.z);
+      if (Math.hypot(sx - p1.x, sy - p1.y) <= 9) return { ann, endpoint: 'p1' };
+      if (Math.hypot(sx - p2.x, sy - p2.y) <= 9) return { ann, endpoint: 'p2' };
+      return null;
+    }
+
+    _hitTestAnnotations(sx, sy) {
+      const state = this.api.getState();
+      const plane = this.api.getActivePlane();
+      if (!plane || !state.layers.annotations) return null;
+      for (let i = this.annHitBoxes.length - 1; i >= 0; i--) {
+        const b = this.annHitBoxes[i];
+        if (sx >= b.x && sx <= b.x + b.w && sy >= b.y && sy <= b.y + b.h) {
+          const ann = state.annotations.find(a => a.id === b.id);
+          if (ann) return { kind: 'text', ann };
+        }
+      }
+      const lines = (state.annotations || []).filter(a => a.view === 'section' && a.planeId === plane.id && a.type === 'line');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const ann = lines[i];
+        const p1 = this.secToScreen(ann.p1.s, ann.p1.z);
+        const p2 = this.secToScreen(ann.p2.s, ann.p2.z);
+        if (this._distPointToSegment(sx, sy, p1.x, p1.y, p2.x, p2.y) <= 6) {
+          return { kind: 'line', ann };
+        }
+      }
+      return null;
     }
 
     _hitTestSlice(sx, sy, sec) {
@@ -353,6 +652,8 @@
       if (w <= 0 || h <= 0) return;
 
       const pal = this._palette();
+      this.dimHitBoxes = [];
+      this.annHitBoxes = [];
 
       ctx.save();
       ctx.scale(dpr, dpr);
@@ -409,7 +710,7 @@
         const p2 = this.secToScreen(sl.sMax, sl.zBase);
         const bw = Math.max(4, p2.x - p1.x);
         const bh = Math.max(4, p2.y - p1.y);
-        const cat = prog.CATEGORIES[sl.vol.cat];
+        const cat = prog.getSpaceStyle(sl.vol);
         const isSel = state.selectedIds.includes(sl.vol.id);
         ctx.save();
         ctx.fillStyle = this._rgba(cat.color, 0.12);
@@ -501,7 +802,7 @@
         const p2 = this.secToScreen(sl.sMax, sl.zBase);
         const bw = Math.max(6, p2.x - p1.x);
         const bh = Math.max(6, p2.y - p1.y);
-        const cat = prog.CATEGORIES[sl.vol.cat];
+        const cat = prog.getSpaceStyle(sl.vol);
         const isSel = state.selectedIds.includes(sl.vol.id);
 
         ctx.save();
@@ -577,13 +878,34 @@
 
       // 6. Section dimensions + draft
       for (const dim of state.dimensions.filter(d => d.view === 'section' && d.planeId === plane.id)) {
-        this._drawSectionDimension(ctx, dim.s1, dim.z1, dim.s2, dim.z2, false, pal);
+        const isSelDim = !!(state.selectedItem && state.selectedItem.kind === 'dim' && state.selectedItem.id === dim.id);
+        this._drawSectionDimension(ctx, dim, false, isSelDim, pal);
       }
       if (this.dimDraft && this.dimDraft.planeId === plane.id) {
-        this._drawSectionDimension(ctx, this.dimDraft.s1, this.dimDraft.z1, this.dimDraft.s2, this.dimDraft.z2, true, pal);
+        this._drawSectionDimension(ctx, this.dimDraft, true, false, pal);
       }
 
-      // 7. Scale bar + Section earthwork summary readout
+      // 7. Section Annotations (Lines/Arrows & Text)
+      if (state.layers.annotations) {
+        for (const ann of (state.annotations || []).filter(a => a.view === 'section' && a.planeId === plane.id)) {
+          const isSelAnn = !!(state.selectedItem && state.selectedItem.id === ann.id);
+          if (ann.type === 'line') this._drawLineAnnotation(ctx, ann, false, isSelAnn, pal);
+          else if (ann.type === 'text') this._drawTextAnnotation(ctx, ann, isSelAnn, pal);
+        }
+      }
+      if (this.lineDraft && this.lineDraft.planeId === plane.id) {
+        this._drawLineAnnotation(ctx, {
+          p1: this.lineDraft.p1,
+          p2: this.lineDraft.p2,
+          startCap: 'none',
+          endCap: 'arrow',
+          dashed: true,
+          strokeWidth: 1.5,
+          color: 'ink'
+        }, true, false, pal);
+      }
+
+      // 8. Scale bar + Section earthwork summary readout
       this._drawSectionOverlay(ctx, w, h, plane, cutSectionTotal, fillSectionTotal, slices, pal);
 
       ctx.restore();
@@ -706,17 +1028,19 @@
       ctx.restore();
     }
 
-    _drawSectionDimension(ctx, s1, z1, s2, z2, isDraft, pal) {
+    _drawSectionDimension(ctx, dim, isDraft, isSelected, pal) {
+      const s1 = dim.s1, z1 = dim.z1, s2 = dim.s2, z2 = dim.z2;
       const p1 = this.secToScreen(s1, z1);
       const p2 = this.secToScreen(s2, z2);
       const ds = Math.abs(s2 - s1);
       const dz = z2 - z1;
       const dist = Math.hypot(ds, dz);
       const slope = ds > 0.1 ? (Math.abs(dz) / ds) * 100 : 0;
+      const screenDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
 
       ctx.save();
       ctx.strokeStyle = isDraft ? pal.dimDraft : pal.dimStroke;
-      ctx.lineWidth = 1.25;
+      ctx.lineWidth = isSelected ? 1.9 : 1.25;
       if (isDraft) ctx.setLineDash([4, 3]);
       ctx.beginPath();
       ctx.moveTo(p1.x, p1.y);
@@ -725,27 +1049,153 @@
       ctx.setLineDash([]);
 
       for (const p of [p1, p2]) {
-        ctx.fillStyle = pal.gripFill;
+        ctx.fillStyle = isSelected ? pal.gripFill : pal.dimStroke;
+        ctx.strokeStyle = isDraft ? pal.dimDraft : pal.dimStroke;
+        ctx.lineWidth = isSelected ? 1.6 : 1.1;
         ctx.beginPath();
-        ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, isSelected ? 5.0 : 3.0, 0, Math.PI * 2);
         ctx.fill();
-        ctx.stroke();
+        if (isSelected) ctx.stroke();
       }
 
-      const mx = (p1.x + p2.x) * 0.5;
-      const my = (p1.y + p2.y) * 0.5;
-      const txt = `${dist.toFixed(2)} m (ΔS ${ds.toFixed(1)} · ΔZ ${dz >= 0 ? '+' : ''}${dz.toFixed(1)}m · ${slope.toFixed(0)}%)`;
-      ctx.font = '500 10px ui-monospace, monospace';
-      const tw = ctx.measureText(txt).width + 10;
-      ctx.fillStyle = pal.badgeBg;
-      ctx.strokeStyle = pal.badgeBorder;
-      ctx.lineWidth = 1;
-      ctx.fillRect(mx - tw * 0.5, my - 17, tw, 16);
-      ctx.strokeRect(mx - tw * 0.5, my - 17, tw, 16);
-      ctx.fillStyle = pal.ink;
+      const showBox = isDraft || isSelected || (this.cam.pxPerM >= 5.2 && screenDist >= 54);
+      if (showBox) {
+        const mx = (p1.x + p2.x) * 0.5;
+        const my = (p1.y + p2.y) * 0.5;
+        const txt = `${dist.toFixed(2)} m (ΔS ${ds.toFixed(1)} · ΔZ ${dz >= 0 ? '+' : ''}${dz.toFixed(1)}m · ${slope.toFixed(0)}%)`;
+        ctx.font = '500 10px ui-monospace, monospace';
+        const tw = ctx.measureText(txt).width + 10;
+        const bx = mx - tw * 0.5;
+        const by = my - 17;
+        const bh = 16;
+        ctx.fillStyle = pal.badgeBg;
+        ctx.strokeStyle = isSelected ? pal.ink : pal.badgeBorder;
+        ctx.lineWidth = isSelected ? 1.6 : 1;
+        ctx.fillRect(bx, by, tw, bh);
+        ctx.strokeRect(bx, by, tw, bh);
+        ctx.fillStyle = pal.ink;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(txt, mx, by + bh * 0.5);
+        if (!isDraft && dim.id) {
+          this.dimHitBoxes.push({ id: dim.id, x: bx, y: by, w: tw, h: bh });
+        }
+      }
+      ctx.restore();
+    }
+
+    _resolveAnnColor(colorVal, pal) {
+      return (colorVal && colorVal !== 'ink') ? colorVal : pal.ink;
+    }
+
+    _drawCap(ctx, pt, dirX, dirY, capType, sw, color) {
+      if (!capType || capType === 'none') return;
+      const ang = Math.atan2(dirY, dirX);
+      const sz = 7 + sw * 1.4;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = Math.max(1.2, sw);
+      if (capType === 'arrow') {
+        ctx.beginPath();
+        ctx.moveTo(pt.x, pt.y);
+        ctx.lineTo(pt.x - Math.cos(ang - 0.42) * sz, pt.y - Math.sin(ang - 0.42) * sz);
+        ctx.lineTo(pt.x - Math.cos(ang + 0.42) * sz, pt.y - Math.sin(ang + 0.42) * sz);
+        ctx.closePath();
+        ctx.fill();
+      } else if (capType === 'open-arrow') {
+        ctx.beginPath();
+        ctx.moveTo(pt.x - Math.cos(ang - 0.45) * sz, pt.y - Math.sin(ang - 0.45) * sz);
+        ctx.lineTo(pt.x, pt.y);
+        ctx.lineTo(pt.x - Math.cos(ang + 0.45) * sz, pt.y - Math.sin(ang + 0.45) * sz);
+        ctx.stroke();
+      } else if (capType === 'dot') {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 2.5 + sw * 0.7, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (capType === 'tick') {
+        const px = -dirY, py = dirX;
+        const ts = 5 + sw;
+        ctx.beginPath();
+        ctx.moveTo(pt.x - (dirX * 0.4 + px) * ts * 0.6, pt.y - (dirY * 0.4 + py) * ts * 0.6);
+        ctx.lineTo(pt.x + (dirX * 0.4 + px) * ts * 0.6, pt.y + (dirY * 0.4 + py) * ts * 0.6);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    _drawLineAnnotation(ctx, ann, isDraft, isSelected, pal) {
+      const p1 = this.secToScreen(ann.p1.s, ann.p1.z);
+      const p2 = this.secToScreen(ann.p2.s, ann.p2.z);
+      const col = this._resolveAnnColor(ann.color, pal);
+      const sw = ann.strokeWidth || 1.5;
+
+      ctx.save();
+      ctx.strokeStyle = col;
+      ctx.lineWidth = isSelected ? sw + 0.8 : sw;
+      if (ann.dashed || isDraft) ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      const dx = p2.x - p1.x, dy = p2.y - p1.y;
+      const len = Math.hypot(dx, dy);
+      if (len > 4) {
+        const ux = dx / len, uy = dy / len;
+        this._drawCap(ctx, p1, -ux, -uy, ann.startCap || 'none', sw, col);
+        this._drawCap(ctx, p2, ux, uy, ann.endCap || 'arrow', sw, col);
+      }
+
+      if (isSelected) {
+        for (const p of [p1, p2]) {
+          ctx.fillStyle = pal.gripFill;
+          ctx.strokeStyle = pal.ink;
+          ctx.lineWidth = 1.6;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 5.0, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+
+    _drawTextAnnotation(ctx, ann, isSelected, pal) {
+      const p = this.secToScreen(ann.s, ann.z);
+      const col = this._resolveAnnColor(ann.color, pal);
+      const fs = ann.fontSize || 12;
+      const label = ann.text || '';
+      if (!label) return;
+
+      ctx.save();
+      ctx.font = `600 ${fs}px sans-serif`;
+      const tw = ctx.measureText(label).width + 12;
+      const th = fs + 8;
+      const bx = p.x - tw * 0.5;
+      const by = p.y - th * 0.5;
+
+      if (ann.boxed || isSelected) {
+        ctx.fillStyle = pal.badgeBg;
+        ctx.strokeStyle = isSelected ? pal.ink : col;
+        ctx.lineWidth = isSelected ? 1.4 : 1;
+        ctx.fillRect(bx, by, tw, th);
+        ctx.strokeRect(bx, by, tw, th);
+      } else {
+        ctx.strokeStyle = pal.bg;
+        ctx.lineWidth = 3;
+        ctx.lineJoin = 'round';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.strokeText(label, p.x, p.y);
+      }
+
+      ctx.fillStyle = col;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(txt, mx, my - 9);
+      ctx.fillText(label, p.x, p.y);
+      this.annHitBoxes.push({ id: ann.id, x: bx, y: by, w: tw, h: th });
       ctx.restore();
     }
 
@@ -849,11 +1299,25 @@
         const p2 = toS(sl.sMax, sl.zBase);
         const bw = Math.max(4, parseFloat(p2.x) - parseFloat(p1.x));
         const bh = Math.max(4, parseFloat(p2.y) - parseFloat(p1.y));
-        const cat = prog.CATEGORIES[sl.vol.cat];
+        const cat = prog.getSpaceStyle(sl.vol);
         parts.push(`<rect x="${p1.x}" y="${p1.y}" width="${bw.toFixed(2)}" height="${bh.toFixed(2)}" fill="${cat.color}" fill-opacity="0.25" stroke="${cat.color}" stroke-width="1.6"/>`);
         const cx = (parseFloat(p1.x) + bw * 0.5).toFixed(1);
         const cy = (parseFloat(p1.y) + bh * 0.5).toFixed(1);
-        parts.push(`<text x="${cx}" y="${cy}" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="600" fill="${pal.ink}">${this._esc(sl.vol.ref + ' ' + sl.vol.short + ' (' + sl.dims.totalArea.toFixed(0) + 'm²)')}</text>`);
+        parts.push(`<text x="${cx}" y="${cy}" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="600" fill="${pal.ink}">${this._esc((sl.vol.ref || sl.vol.id) + ' ' + sl.vol.short + ' (' + sl.dims.totalArea.toFixed(0) + 'm²)')}</text>`);
+      }
+
+      if (state.layers.annotations) {
+        for (const ann of (state.annotations || []).filter(a => a.view === 'section' && a.planeId === plane.id)) {
+          const col = this._resolveAnnColor(ann.color, pal);
+          if (ann.type === 'line') {
+            const p1 = toS(ann.p1.s, ann.p1.z), p2 = toS(ann.p2.s, ann.p2.z);
+            const dash = ann.dashed ? ' stroke-dasharray="5 4"' : '';
+            parts.push(`<line x1="${p1.x}" y1="${p1.y}" x2="${p2.x}" y2="${p2.y}" stroke="${col}" stroke-width="${ann.strokeWidth || 1.5}"${dash}/>`);
+          } else if (ann.type === 'text') {
+            const p = toS(ann.s, ann.z);
+            parts.push(`<text x="${p.x}" y="${p.y}" text-anchor="middle" dominant-baseline="central" font-family="sans-serif" font-size="${ann.fontSize || 12}" font-weight="600" fill="${col}">${this._esc(ann.text || '')}</text>`);
+          }
+        }
       }
 
       parts.push('</svg>');

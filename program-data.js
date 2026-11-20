@@ -4,8 +4,18 @@
     A: { id: 'A', name: 'Living (the residents)', short: 'Living', color: '#b8945c', fill: 'rgba(184, 148, 92, 0.30)', fillStrong: 'rgba(184, 148, 92, 0.56)', stroke: '#8c6932' },
     B: { id: 'B', name: 'Arrival & gathering (the public heart)', short: 'Public', color: '#b56b58', fill: 'rgba(181, 107, 88, 0.30)', fillStrong: 'rgba(181, 107, 88, 0.56)', stroke: '#8f4736' },
     C: { id: 'C', name: 'Knowledge (the quiet core)', short: 'Knowledge', color: '#627788', fill: 'rgba(98, 119, 136, 0.30)', fillStrong: 'rgba(98, 119, 136, 0.56)', stroke: '#415566' },
-    D: { id: 'D', name: 'Land, animals & service (the working edge)', short: 'Land & Service', color: '#6c8669', fill: 'rgba(108, 134, 105, 0.30)', fillStrong: 'rgba(108, 134, 105, 0.56)', stroke: '#496346' }
+    D: { id: 'D', name: 'Land, animals & service (the working edge)', short: 'Land & Service', color: '#6c8669', fill: 'rgba(108, 134, 105, 0.30)', fillStrong: 'rgba(108, 134, 105, 0.56)', stroke: '#496346' },
+    CUSTOM: { id: 'CUSTOM', name: 'Custom spaces', short: 'Custom', color: '#8b7285', fill: 'rgba(139, 114, 133, 0.30)', fillStrong: 'rgba(139, 114, 133, 0.56)', stroke: '#634d5e' }
   };
+
+  const CUSTOM_SWATCHES = [
+    '#b8945c', '#b56b58', '#627788', '#6c8669', '#8b7285',
+    '#7a8c89', '#a3836b', '#6b7b6e', '#947c5d', '#736e66'
+  ];
+
+  const ANNOTATION_SWATCHES = [
+    'ink', '#b85d43', '#b8945c', '#627788', '#6c8669', '#8b7285', '#6d685f'
+  ];
 
   /* Keywords extracted from highlights in MM26WS_Groundwork_Roombook.pdf */
   const KEYWORDS = [
@@ -248,14 +258,31 @@
     return { score, sharedKeywords: shared, hasDirectLink, hasConflict };
   }
 
+  function getSpaceStyle(item) {
+    const baseCat = (item && CATEGORIES[item.cat]) || CATEGORIES.CUSTOM;
+    if (item && item.customColor) {
+      return { ...baseCat, color: item.customColor };
+    }
+    return baseCat;
+  }
+
+  function isAreaLocked(vol) {
+    if (!vol) return true;
+    return typeof vol.areaLocked === 'boolean' ? vol.areaLocked : !vol.freeResize;
+  }
+
   window.GROUNDWORK_PROGRAM = {
     DEFAULT_FLOOR_HEIGHT: 3.0,
     NET_TOTAL_TARGET: 983,
     GROSS_MULTIPLIER: 1.32,
     CATEGORIES,
+    CUSTOM_SWATCHES,
+    ANNOTATION_SWATCHES,
     KEYWORDS,
     PROGRAM_TEMPLATES,
     createCatalogSpaces,
-    computeRelevance
+    computeRelevance,
+    getSpaceStyle,
+    isAreaLocked
   };
 })();

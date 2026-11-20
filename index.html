@@ -25,8 +25,10 @@
         <div class="sep"></div>
         <div class="segmented" id="toolSwitch">
           <button class="seg-btn active" data-tool="select" title="Select, Move, Resize, Edit Height (V)">Select</button>
-          <button class="seg-btn" data-tool="dimension" title="Measure distance &amp; elevation across Plan, 3D, Section (D)">Dimension</button>
-          <button class="seg-btn" data-tool="section" title="Draw or move Section Clipping Plane on Plan (C)">Section Plane</button>
+          <button class="seg-btn" data-tool="dimension" title="Measure distance &amp; elevation across Plan, 3D, Section (D)">Dim</button>
+          <button class="seg-btn" data-tool="line" title="Draw Line / Arrow annotation (L)">Line</button>
+          <button class="seg-btn" data-tool="text" title="Add Text annotation (A)">Text</button>
+          <button class="seg-btn" data-tool="section" title="Draw or move Section Clipping Plane on Plan (C)">Section</button>
         </div>
       </div>
 
@@ -65,6 +67,8 @@
           <span>Click or drag a space onto the site</span>
         </div>
         <div class="bar-group">
+          <button class="btn" id="btnAddCustomBubble" title="Create a custom space bubble">+ Custom</button>
+          <div class="sep"></div>
           <span style="font-size:10.5px;color:var(--ink-muted);">Sort:</span>
           <div class="segmented" id="dockSortSwitch">
             <button class="seg-btn active" data-sort="program">Program</button>
@@ -89,6 +93,8 @@
               <span style="color:var(--ink-muted);font-weight:400;">Stretch edges (area-locked) · Rotate · Drag near to merge keywords</span>
             </div>
             <div class="vp-controls">
+              <button class="vp-btn active" id="btnToggleRectDims" title="Show rectangle dimensions when zoomed in (R)">Rect Dims</button>
+              <button class="vp-btn active" id="btnPlanAnnToggle" title="Toggle Text &amp; Line annotations">Annotations</button>
               <button class="vp-btn" id="btnShowDock" style="display:none;" title="Show Program Bar (B)">Program Bar</button>
               <button class="vp-btn" id="btnPlanFit" title="Fit Site (F)">Fit Site</button>
             </div>
@@ -126,6 +132,7 @@
             </div>
             <div class="vp-controls">
               <div id="secQuickTabs" style="display:inline-flex;gap:2px;"></div>
+              <button class="vp-btn active" id="btnSecAnnToggle" title="Toggle Text &amp; Line annotations">Annotations</button>
               <button class="vp-btn" id="btnSecFlip" title="Flip Section Direction (X)">Flip</button>
               <button class="vp-btn" id="btnSecFit" title="Fit Section (F)">Fit Section</button>
             </div>
@@ -219,9 +226,12 @@
             <div class="shortcut-list">
               <div class="shortcut-row"><span>Select / Move</span><span class="kbd">V</span></div>
               <div class="shortcut-row"><span>Dimension tool</span><span class="kbd">D</span></div>
+              <div class="shortcut-row"><span>Line / Arrow tool</span><span class="kbd">L</span></div>
+              <div class="shortcut-row"><span>Text annotation tool</span><span class="kbd">A</span></div>
               <div class="shortcut-row"><span>Section Plane tool</span><span class="kbd">C</span></div>
               <div class="shortcut-row"><span>Toggle 3D Clipping</span><span class="kbd">Shift + C</span></div>
               <div class="shortcut-row"><span>Flip Section direction</span><span class="kbd">X</span></div>
+              <div class="shortcut-row"><span>Toggle rectangle dims</span><span class="kbd">R</span></div>
               <div class="shortcut-row"><span>Split / Plan / 3D / Section</span><span class="kbd">1 – 4</span></div>
               <div class="shortcut-row"><span>Fit Site across views</span><span class="kbd">F</span></div>
               <div class="shortcut-row"><span>Translucent Ground (3D)</span><span class="kbd">T</span></div>
@@ -237,7 +247,7 @@
               <div class="shortcut-row"><span>Snap Base Z to slope</span><span class="kbd">Z</span></div>
               <div class="shortcut-row"><span>Rotate -15° / +15°</span><span class="kbd">Q / E</span></div>
               <div class="shortcut-row"><span>Floor height -0.2 / +0.2m</span><span class="kbd">[ / ]</span></div>
-              <div class="shortcut-row"><span>Remove selected space</span><span class="kbd">Del</span></div>
+              <div class="shortcut-row"><span>Remove selected space / annotation</span><span class="kbd">Del</span></div>
               <div class="shortcut-row"><span>Cancel / Select mode</span><span class="kbd">Esc</span></div>
               <div class="shortcut-row"><span>Pan (Plan &amp; Section)</span><span class="kbd">Space + Drag</span></div>
               <div class="shortcut-row"><span>Undo / Redo</span><span class="kbd">Ctrl + Z / Y</span></div>
@@ -249,6 +259,71 @@
       </div>
     </div>
   </div>
+
+  <!-- Centered Custom Space Bubble Modal -->
+  <div class="modal-backdrop" id="customBubbleModal" role="dialog" aria-modal="true" aria-labelledby="customBubbleModalTitle">
+    <div class="modal-card">
+      <div class="modal-head">
+        <span class="modal-title" id="customBubbleModalTitle">Create Custom Space Bubble</span>
+        <button class="btn subtle" id="btnCloseCustomModal" type="button" style="padding:2px 8px;">Close</button>
+      </div>
+      <form class="modal-body" id="customBubbleForm">
+        <div class="field-grid">
+          <div class="field">
+            <label for="cbName">Name</label>
+            <input type="text" id="cbName" required placeholder="e.g. Clay Workshop" />
+          </div>
+          <div class="field">
+            <label for="cbRef">Code / Ref</label>
+            <input type="text" id="cbRef" maxlength="10" placeholder="U1" />
+          </div>
+        </div>
+        <div class="field">
+          <label for="cbDesc">Description / Notes</label>
+          <textarea id="cbDesc" rows="2" placeholder="Purpose, daylight, acoustic, or slope requirements…"></textarea>
+        </div>
+        <div class="field">
+          <label>Color (Muted Palette or Custom)</label>
+          <div class="row-between">
+            <div class="swatch-row" id="cbSwatches"></div>
+            <label class="color-picker-inline" title="Pick custom hex color">
+              <input type="color" id="cbColor" value="#8b7285" />
+              <span id="cbColorHex">#8b7285</span>
+            </label>
+          </div>
+        </div>
+        <div class="field-grid">
+          <div class="field">
+            <label for="cbArea">Target Area (m²)</label>
+            <input type="number" id="cbArea" step="1" min="1" max="5000" value="40" required />
+          </div>
+          <div class="field">
+            <label>&nbsp;</label>
+            <label class="kw-check-row" style="border:1px solid var(--border);border-radius:4px;padding:4px 7px;background:var(--bg);">
+              <span class="kw-check-left">
+                <input type="checkbox" id="cbAreaLocked" checked />
+                <span>Lock area while resizing</span>
+              </span>
+            </label>
+          </div>
+          <div class="field">
+            <label for="cbFloors">Floors</label>
+            <input type="number" id="cbFloors" step="1" min="1" max="6" value="1" />
+          </div>
+          <div class="field">
+            <label for="cbFloorH">Floor Height (m)</label>
+            <input type="number" id="cbFloorH" step="0.1" min="1.5" max="14" value="3.0" />
+          </div>
+        </div>
+        <div class="row-between" style="justify-content:flex-end;gap:8px;padding-top:4px;">
+          <button class="btn subtle" type="button" id="btnCancelCustomModal">Cancel</button>
+          <button class="btn active" type="submit">Create &amp; Place Bubble</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <input type="text" id="inlineTextEditor" class="inline-text-editor" placeholder="Type annotation, Enter to save…" />
 
   <div class="toast" id="toast"></div>
 

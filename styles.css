@@ -54,7 +54,7 @@ html, body {
   -webkit-font-smoothing: antialiased;
 }
 
-button, input, select { font-family: inherit; font-size: inherit; color: inherit; }
+button, input, select, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 
 #app {
   display: flex; flex-direction: column; width: 100vw; height: 100vh;
@@ -196,18 +196,20 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
   background: var(--hud-bg); border: 1px solid var(--border);
   border-radius: 4px; padding: 3px 8px; font-size: 11px; font-weight: 500;
   display: inline-flex; align-items: center; gap: 8px;
-  backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px); white-space: nowrap;
 }
+.viewports-area.mode-split .vp-tag span:nth-child(2) { display: none; }
 .vp-controls {
   pointer-events: auto;
   display: inline-flex; align-items: center; gap: 4px;
   background: var(--hud-bg); border: 1px solid var(--border);
   border-radius: 4px; padding: 2px 5px;
-  backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px); flex-shrink: 0;
 }
 .vp-btn {
   border: 1px solid transparent; background: transparent; padding: 2px 6px;
   border-radius: 3px; cursor: pointer; font-size: 11px; color: var(--ink-muted);
+  white-space: nowrap;
 }
 .vp-btn:hover { background: var(--surface-2); color: var(--ink); }
 .vp-btn.active { background: var(--ink); color: var(--surface); }
@@ -285,11 +287,52 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 .field label { font-size: 10.5px; color: var(--ink-muted); }
 .field input[type="number"],
 .field input[type="text"],
-.field select {
+.field select,
+.field textarea {
   width: 100%; padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px;
   background: var(--surface); font-family: var(--mono); font-size: 11.5px;
 }
+.field textarea {
+  font-family: var(--font); resize: vertical; line-height: 1.35;
+}
 .field input[type="range"] { width: 100%; accent-color: var(--ink); }
+
+.swatch-row {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 5px;
+}
+.swatch-btn {
+  width: 18px; height: 18px; border-radius: 4px; padding: 0;
+  border: 1px solid var(--border-strong); cursor: pointer;
+  transition: transform 0.1s, border-color 0.1s;
+}
+.swatch-btn:hover { transform: scale(1.08); }
+.swatch-btn.active {
+  border: 2px solid var(--ink);
+  box-shadow: 0 0 0 1px var(--surface) inset;
+}
+.color-picker-inline {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 6px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--surface); font-family: var(--mono); font-size: 10.5px; cursor: pointer;
+}
+.color-picker-inline input[type="color"] {
+  width: 18px; height: 18px; padding: 0; border: none; background: transparent; cursor: pointer;
+}
+.lock-toggle-btn {
+  padding: 3px 7px; font-size: 10.5px; border-radius: 4px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--ink-muted);
+  cursor: pointer; white-space: nowrap; flex-shrink: 0;
+}
+.lock-toggle-btn:hover { border-color: var(--border-strong); color: var(--ink); }
+.lock-toggle-btn.locked {
+  background: var(--ink); color: var(--surface); border-color: var(--ink);
+}
+.inline-text-editor {
+  position: fixed; z-index: 220; display: none; min-width: 150px; max-width: 320px;
+  padding: 3px 7px; border: 1.5px solid var(--ink); border-radius: 4px;
+  background: var(--surface); color: var(--ink); font-size: 12px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22); outline: none;
+}
 
 .row-between { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .row-wrap { display: flex; flex-wrap: wrap; gap: 4px; }

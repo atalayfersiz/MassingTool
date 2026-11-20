@@ -519,11 +519,11 @@
       for (const vol of state.volumes) {
         seenIds.add(vol.id);
         const dims = eng.getEffectiveDims(vol, state.useGross);
-        const cat = prog.CATEGORIES[vol.cat];
+        const cat = prog.getSpaceStyle(vol);
         const isSelected = state.selectedIds.includes(vol.id);
 
         let grp = this.volumeGroups.get(vol.id);
-        const sig = `${dims.w.toFixed(3)}|${dims.d.toFixed(3)}|${dims.totalHeight.toFixed(3)}|${dims.floors}`;
+        const sig = `${dims.w.toFixed(3)}|${dims.d.toFixed(3)}|${dims.totalHeight.toFixed(3)}|${dims.floors}|${cat.color}`;
         if (!grp) {
           grp = new THREE.Group();
           grp.userData.volId = vol.id;
@@ -772,7 +772,10 @@
         this.labelLayer.appendChild(el);
         this.dimLabelEls.push({
           el,
-          pos: new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5)
+          pos: new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5),
+          a: a.clone(),
+          b: b.clone(),
+          isDraft: !!d.draft
         });
       }
     }
@@ -813,6 +816,8 @@
       const plane = this.api.getActivePlane();
       const eng = window.GROUNDWORK_ENGINE;
       const tmp = new THREE.Vector3();
+      const tmpA = new THREE.Vector3();
+      const tmpB = new THREE.Vector3();
 
       for (const vol of state.volumes) {
         const el = this.labelEls.get(vol.id);
@@ -844,6 +849,15 @@
 
       for (const dl of this.dimLabelEls) {
         if (!dl || !dl.el) continue;
+        if (!dl.isDraft && dl.a && dl.b) {
+          tmpA.copy(dl.a).project(this.camera);
+          tmpB.copy(dl.b).project(this.camera);
+          const sDist = Math.hypot((tmpA.x - tmpB.x) * 0.5 * w, (tmpA.y - tmpB.y) * 0.5 * h);
+          if (sDist < 54) {
+            dl.el.style.display = 'none';
+            continue;
+          }
+        }
         tmp.copy(dl.pos).project(this.camera);
         if (tmp.z > 1 || tmp.z < -1) {
           dl.el.style.display = 'none';
