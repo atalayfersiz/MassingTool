@@ -193,7 +193,8 @@
     if (!vol) return;
     state.selectedItem = null;
     if (expandGroup && vol.groupId) {
-      state.selectedIds = state.volumes.filter(v => v.groupId === vol.groupId).map(v => v.id);
+      const others = state.volumes.filter(v => v.groupId === vol.groupId && v.id !== id).map(v => v.id);
+      state.selectedIds = [id, ...others];
     } else {
       state.selectedIds = [id];
     }

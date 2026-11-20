@@ -253,7 +253,9 @@
               type: handleHit.kind === 'rotate' ? 'rotate' : 'resize',
               id: vol.id,
               handle: handleHit.kind,
-              origVol: { ...vol }
+              origVol: { ...vol },
+              origGz: window.GROUNDWORK_ENGINE.getGroundZ(vol.x, vol.y),
+              altStart: !!e.altKey
             };
             this.canvas.setPointerCapture(e.pointerId);
             return;
@@ -327,6 +329,8 @@
             this.api.toggleSelect(hitVol.id);
           } else if (!alreadySelected) {
             this.api.selectVolume(hitVol.id, e.detail < 2);
+          } else if (state.selectedIds[0] !== hitVol.id) {
+            this.api.setSelection([hitVol.id, ...state.selectedIds.filter(id => id !== hitVol.id)]);
           }
           const dragIds = this.api.getState().selectedIds.slice();
           const origins = {};
@@ -348,7 +352,9 @@
             startWorld: world,
             primaryId: hitVol.id,
             origins,
-            moved: false
+            moved: false,
+            wasAlreadySelected: alreadySelected,
+            shiftKey: !!e.shiftKey
           };
           this.canvas.setPointerCapture(e.pointerId);
           this.render();
@@ -522,7 +528,16 @@
         }
 
         if (this.dragState.type === 'resize') {
+          const eng = window.GROUNDWORK_ENGINE;
           const orig = this.dragState.origVol;
+          const origDims = eng.getEffectiveDims(orig, state.useGross);
+          const lin = Math.sqrt(origDims.grossFactor);
+          const floors = Math.max(1, orig.floors || 1);
+          const footprintArea = orig.area / floors;
+          const locked = window.GROUNDWORK_PROGRAM.isAreaLocked(orig);
+          const h = this.dragState.handle;
+          const symmetric = !!(e.altKey || this.dragState.altStart);
+
           const dx = world.x - orig.x;
           const dy = world.y - orig.y;
           const c = Math.cos(orig.rot || 0);
@@ -530,8 +545,8 @@
           let lx = dx * c + dy * s;
           let ly = -dx * s + dy * c;
 
-          if (state.layers.snap !== false && !e.altKey) {
-            const rzs = this._computeResizeSnap(orig, this.dragState.handle, lx, ly, state);
+          if (state.layers.snap !== false) {
+            const rzs = this._computeResizeSnap(orig, origDims, h, lx, ly, symmetric, state);
             lx = rzs.lx;
             ly = rzs.ly;
             this.snapGuides = rzs.guides || [];
@@ -539,33 +554,67 @@
             this.snapGuides = [];
           }
 
-          const dims = window.GROUNDWORK_ENGINE.getEffectiveDims(orig, state.useGross);
-          const lin = Math.sqrt(dims.grossFactor);
-          const floors = Math.max(1, orig.floors || 1);
-          const footprintArea = orig.area / floors;
-          const locked = window.GROUNDWORK_PROGRAM.isAreaLocked(orig);
+          const uWest0 = -origDims.w * 0.5;
+          const uEast0 = origDims.w * 0.5;
+          const vSouth0 = -origDims.d * 0.5;
+          const vNorth0 = origDims.d * 0.5;
+
+          let rawEffW = origDims.w;
+          let rawEffD = origDims.d;
+          if (symmetric) {
+            if (h.includes('e') || h.includes('w')) rawEffW = Math.abs(lx) * 2;
+            if (h.includes('n') || h.includes('s')) rawEffD = Math.abs(ly) * 2;
+          } else {
+            if (h.includes('e')) rawEffW = lx - uWest0;
+            else if (h.includes('w')) rawEffW = uEast0 - lx;
+            if (h.includes('n')) rawEffD = ly - vSouth0;
+            else if (h.includes('s')) rawEffD = vNorth0 - ly;
+          }
 
           let newW = orig.w;
           let newD = orig.d;
-          const h = this.dragState.handle;
-
           if (!locked) {
-            if (h.includes('e') || h.includes('w')) newW = Math.max(0.8, (Math.abs(lx) * 2) / lin);
-            if (h.includes('n') || h.includes('s')) newD = Math.max(0.8, (Math.abs(ly) * 2) / lin);
-            const newArea = Math.round(newW * newD * floors * 10) / 10;
-            this.api.updateVolume(orig.id, { w: newW, d: newD, area: newArea }, { silentUndo: true });
+            if (h.includes('e') || h.includes('w')) newW = Math.max(0.8, rawEffW / lin);
+            if (h.includes('n') || h.includes('s')) newD = Math.max(0.8, rawEffD / lin);
           } else {
             const minSide = Math.min(1.5, Math.max(0.5, Math.sqrt(footprintArea) * 0.5));
             const maxSide = footprintArea / minSide;
-            if (h === 'n' || h === 's') {
-              newD = Math.max(minSide, Math.min(maxSide, (Math.abs(ly) * 2) / lin));
-              newW = footprintArea / newD;
-            } else {
-              newW = Math.max(minSide, Math.min(maxSide, (Math.abs(lx) * 2) / lin));
+            const hasU = h.includes('e') || h.includes('w');
+            const hasV = h.includes('n') || h.includes('s');
+            const driveU = hasU && (!hasV || Math.abs(rawEffW - origDims.w) >= Math.abs(rawEffD - origDims.d));
+            if (driveU) {
+              newW = Math.max(minSide, Math.min(maxSide, rawEffW / lin));
               newD = footprintArea / newW;
+            } else {
+              newD = Math.max(minSide, Math.min(maxSide, rawEffD / lin));
+              newW = footprintArea / newD;
             }
-            this.api.updateVolume(orig.id, { w: newW, d: newD }, { silentUndo: true });
           }
+
+          const finalEffW = newW * lin;
+          const finalEffD = newD * lin;
+          let cu = 0;
+          let cv = 0;
+          if (!symmetric) {
+            if (h.includes('e')) cu = uWest0 + finalEffW * 0.5;
+            else if (h.includes('w')) cu = uEast0 - finalEffW * 0.5;
+            if (h.includes('n')) cv = vSouth0 + finalEffD * 0.5;
+            else if (h.includes('s')) cv = vNorth0 - finalEffD * 0.5;
+          }
+
+          const nx = orig.x + cu * c - cv * s;
+          const ny = orig.y + cu * s + cv * c;
+          const origGz = Number.isFinite(this.dragState.origGz)
+            ? this.dragState.origGz
+            : eng.getGroundZ(orig.x, orig.y);
+          const zOffset = orig.zBase - origGz;
+          const newZBase = Math.round((eng.getGroundZ(nx, ny) + zOffset) * 100) / 100;
+
+          const patch = { x: nx, y: ny, zBase: newZBase, w: newW, d: newD };
+          if (!locked) {
+            patch.area = Math.round(newW * newD * floors * 10) / 10;
+          }
+          this.api.updateVolume(orig.id, patch, { silentUndo: true });
           return;
         }
 
@@ -641,6 +690,12 @@
               v.x >= minX && v.x <= maxX && v.y >= minY && v.y <= maxY
             ).map(v => v.id);
             if (hits.length) this.api.setSelection(hits);
+          }
+        }
+        if (this.dragState.type === 'move' && !this.dragState.moved && !this.dragState.shiftKey) {
+          const st = this.api.getState();
+          if (this.dragState.wasAlreadySelected && st.selectedIds.length > 1) {
+            this.api.selectVolume(this.dragState.primaryId, false);
           }
         }
         try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) {}
@@ -816,12 +871,12 @@
 
     _hitTestHandles(sx, sy) {
       const state = this.api.getState();
-      if (state.selectedIds.length !== 1) return null;
+      if (state.selectedIds.length === 0) return null;
       const vol = this.api.getVolume(state.selectedIds[0]);
       if (!vol) return null;
       const handles = this._getHandlesForVolume(vol, state.useGross);
       for (const h of handles) {
-        if (Math.hypot(sx - h.x, sy - h.y) <= 8) {
+        if (Math.hypot(sx - h.x, sy - h.y) <= 10) {
           return { id: vol.id, kind: h.kind };
         }
       }
@@ -1225,7 +1280,7 @@
       }
 
       // Selection handles
-      if (state.selectedIds.length === 1) {
+      if (state.selectedIds.length >= 1) {
         const sel = this.api.getVolume(state.selectedIds[0]);
         if (sel) this._drawHandles(ctx, sel, state.useGross, pal);
       }
@@ -2267,13 +2322,18 @@
       };
     }
 
-    _computeResizeSnap(orig, handle, lx, ly, state) {
+    _computeResizeSnap(orig, origDims, handle, lx, ly, symmetric, state) {
       const eng = window.GROUNDWORK_ENGINE;
-      const snapTol = Math.max(0.35, Math.min(1.6, 10 / Math.max(0.5, this.cam.pxPerM)));
+      const snapTol = Math.max(0.18, Math.min(0.45, 5 / Math.max(0.5, this.cam.pxPerM)));
       const rot = orig.rot || 0;
       const c = Math.cos(rot), s = Math.sin(rot);
       const wantU = handle.includes('e') || handle.includes('w');
       const wantV = handle.includes('n') || handle.includes('s');
+
+      const uHalf0 = origDims.w * 0.5;
+      const vHalf0 = origDims.d * 0.5;
+      const startU = handle.includes('e') ? uHalf0 : (handle.includes('w') ? -uHalf0 : 0);
+      const startV = handle.includes('n') ? vHalf0 : (handle.includes('s') ? -vHalf0 : 0);
 
       let bestU = null;
       let bestV = null;
@@ -2283,31 +2343,37 @@
         if (Math.abs(Math.sin((B.rot || 0) - rot)) > 0.08) continue;
         const corners = eng.getFootprintCorners(B, state.useGross);
         let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
-        for (const [cx, cy] of corners) {
-          const u = (cx - orig.x) * c + (cy - orig.y) * s;
-          const v = -(cx - orig.x) * s + (cy - orig.y) * c;
+        for (const pt of corners) {
+          const u = (pt.x - orig.x) * c + (pt.y - orig.y) * s;
+          const v = -(pt.x - orig.x) * s + (pt.y - orig.y) * c;
           if (u < minU) minU = u;
           if (u > maxU) maxU = u;
           if (v < minV) minV = v;
           if (v > maxV) maxV = v;
         }
-        if (Math.abs((minU + maxU) * 0.5) > 36 && Math.abs((minV + maxV) * 0.5) > 36) continue;
+        const gapU = Math.max(0, minU - uHalf0, -uHalf0 - maxU);
+        const gapV = Math.max(0, minV - vHalf0, -vHalf0 - maxV);
+        if (gapU > 12 || gapV > 12) continue;
 
         if (wantU) {
           for (const targetU of [minU, maxU]) {
-            if ((lx >= 0 && targetU <= 0.3) || (lx < 0 && targetU >= -0.3)) continue;
+            if (handle.includes('e') && targetU < (symmetric ? 0.4 : -uHalf0 + 0.8)) continue;
+            if (handle.includes('w') && targetU > (symmetric ? -0.4 : uHalf0 - 0.8)) continue;
+            if (Math.abs(targetU - startU) < 0.25) continue;
             const err = Math.abs(lx - targetU);
             if (err < snapTol && (!bestU || err < bestU.err)) {
-              bestU = { err, targetU, minV: Math.min(minV, -orig.d * 0.5), maxV: Math.max(maxV, orig.d * 0.5) };
+              bestU = { err, targetU, minV: Math.min(minV, -vHalf0), maxV: Math.max(maxV, vHalf0) };
             }
           }
         }
         if (wantV) {
           for (const targetV of [minV, maxV]) {
-            if ((ly >= 0 && targetV <= 0.3) || (ly < 0 && targetV >= -0.3)) continue;
+            if (handle.includes('n') && targetV < (symmetric ? 0.4 : -vHalf0 + 0.8)) continue;
+            if (handle.includes('s') && targetV > (symmetric ? -0.4 : vHalf0 - 0.8)) continue;
+            if (Math.abs(targetV - startV) < 0.25) continue;
             const err = Math.abs(ly - targetV);
             if (err < snapTol && (!bestV || err < bestV.err)) {
-              bestV = { err, targetV, minU: Math.min(minU, -orig.w * 0.5), maxU: Math.max(maxU, orig.w * 0.5) };
+              bestV = { err, targetV, minU: Math.min(minU, -uHalf0), maxU: Math.max(maxU, uHalf0) };
             }
           }
         }
