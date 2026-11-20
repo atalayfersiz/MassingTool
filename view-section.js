@@ -21,6 +21,8 @@
       this.hoverItem = null;
       this.spaceHeld = false;
       this.lastSlices = [];
+      this.lastPadSlices = [];
+      this.lastCircSlices = [];
       this.snapGuides = [];
 
       this._bindEvents();
@@ -310,9 +312,44 @@
           return;
         }
 
+        // 5b. Terrain pad push/pull click & drag in Section
+        const padHit = this._hitTestTerrainModSlice(sec);
+        if (padHit) {
+          this.api.selectItem('terrain', padHit.mod.id);
+          this.api.pushUndo();
+          this.dragState = {
+            type: 'tmod-z',
+            modId: padHit.mod.id,
+            startZ: sec.z,
+            mode: padHit.mod.mode,
+            origTargetZ: padHit.mod.targetZ,
+            origDeltaZ: padHit.mod.deltaZ || 0
+          };
+          this.canvas.setPointerCapture(e.pointerId);
+          this.render();
+          return;
+        }
+
+        // 5c. Ramp / Stair body click in Section
+        const circHit = this._hitTestCircSlice(sec);
+        if (circHit) {
+          this.api.selectItem('circulation', circHit.circ.id);
+          this.render();
+          return;
+        }
+
+        // 6. Empty canvas -> start Window (L->R) / Crossing (R->L) Marquee Box Selection
         if (!e.shiftKey) {
           this.api.clearSelection();
         }
+        this.dragState = {
+          type: 'marquee',
+          startPos: pos,
+          currPos: pos,
+          shiftKey: !!e.shiftKey
+        };
+        this.canvas.setPointerCapture(e.pointerId);
+        this.render();
       });
 
       this.canvas.addEventListener('pointermove', (e) => {
@@ -455,12 +492,50 @@
             });
           }
           this.api.updateVolumesBatch(updates, { silentUndo: true });
+          return;
+        }
+
+        if (this.dragState.type === 'tmod-z') {
+          const dz = sec.z - this.dragState.startZ;
+          const patch = this.dragState.mode === 'offset'
+            ? { deltaZ: Math.round((this.dragState.origDeltaZ + dz) * 100) / 100 }
+            : { targetZ: Math.round((this.dragState.origTargetZ + dz) * 100) / 100 };
+          this.api.updateTerrainMod(this.dragState.modId, patch, { silentUndo: true });
+          return;
+        }
+
+        if (this.dragState.type === 'marquee') {
+          this.dragState.currPos = pos;
+          this.render();
         }
       });
 
       this.canvas.addEventListener('pointerup', (e) => {
         if (!this.dragState) return;
         this.snapGuides = [];
+        if (this.dragState.type === 'marquee') {
+          const a = this.screenToSec(this.dragState.startPos.x, this.dragState.startPos.y);
+          const b = this.screenToSec(this.dragState.currPos.x, this.dragState.currPos.y);
+          const minS = Math.min(a.s, b.s), maxS = Math.max(a.s, b.s);
+          const minZ = Math.min(a.z, b.z), maxZ = Math.max(a.z, b.z);
+          const isWindow = this.dragState.currPos.x >= this.dragState.startPos.x;
+          if (Math.hypot(this.dragState.currPos.x - this.dragState.startPos.x, this.dragState.currPos.y - this.dragState.startPos.y) > 6) {
+            const st = this.api.getState();
+            const hits = this.lastSlices.filter(sl => {
+              const s0 = sl.sMin, s1 = sl.sMax, z0 = sl.zBase, z1 = sl.zPeak || sl.zTop;
+              return isWindow
+                ? (s0 >= minS && s1 <= maxS && z0 >= minZ && z1 <= maxZ)
+                : (s1 >= minS && s0 <= maxS && z1 >= minZ && z0 <= maxZ);
+            }).map(sl => sl.vol.id);
+            if (hits.length) {
+              if (this.dragState.shiftKey) {
+                this.api.setSelection([...new Set([...st.selectedIds, ...hits])]);
+              } else {
+                this.api.setSelection(hits);
+              }
+            }
+          }
+        }
         if (this.dragState.type === 'line-draw' && this.lineDraft && this.lineDraft.moved) {
           const p2 = this.lineDraft.p2;
           if (Math.hypot(p2.s - this.lineDraft.p1.s, p2.z - this.lineDraft.p1.z) > 0.2) {
@@ -825,8 +900,10 @@
         ctx.restore();
       }
 
-      // 3. Draw site boundary intersections on section plane
+      // 3. Draw site boundary intersections + original dashed grade + Terrain Pad Cut/Fill & Retaining Walls
       this._drawSiteBoundaryTicks(ctx, basis, h, pal);
+      this._drawTerrainModSlices(ctx, state, plane, basis, pal);
+      this._drawCirculationSlices(ctx, state, plane, pal);
 
       // 4. Draw Cut & Fill soil polygons for cut spaces
       let cutSectionTotal = 0;
@@ -984,6 +1061,36 @@
       // Magnetic Snap Guides in Section
       if (this.snapGuides && this.snapGuides.length > 0) {
         this._drawSnapGuides(ctx, pal, state.theme === 'dark');
+      }
+
+      // Section Marquee Box Selection (L->R Window solid blue | R->L Crossing dashed green)
+      if (this.dragState && this.dragState.type === 'marquee') {
+        const s = this.dragState.startPos;
+        const c = this.dragState.currPos;
+        const isWin = c.x >= s.x;
+        const isDark = state.theme === 'dark';
+        const col = isWin ? (isDark ? '#63a9db' : '#2f6f9e') : (isDark ? '#6cb985' : '#3e7d53');
+        const fill = isWin
+          ? (isDark ? 'rgba(99,169,219,0.16)' : 'rgba(47,111,158,0.12)')
+          : (isDark ? 'rgba(108,185,133,0.16)' : 'rgba(62,125,83,0.12)');
+        const rx = Math.min(s.x, c.x), ry = Math.min(s.y, c.y);
+        const rw = Math.abs(c.x - s.x), rh = Math.abs(c.y - s.y);
+        ctx.save();
+        ctx.fillStyle = fill;
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash(isWin ? [] : [5, 4]);
+        ctx.fillRect(rx, ry, rw, rh);
+        ctx.strokeRect(rx, ry, rw, rh);
+        ctx.setLineDash([]);
+        if (rw > 40 && rh > 15) {
+          ctx.font = '600 9.5px ui-monospace, monospace';
+          ctx.fillStyle = col;
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'top';
+          ctx.fillText(isWin ? 'Window' : 'Crossing', rx + 4, ry + 3);
+        }
+        ctx.restore();
       }
 
       // 6. Section dimensions + draft
@@ -1577,6 +1684,149 @@
         }
       }
       ctx.restore();
+    }
+
+    _hitTestTerrainModSlice(sec) {
+      const tolZ = Math.max(0.8, 12 / Math.max(1, this.cam.pxPerM));
+      for (const ps of (this.lastPadSlices || [])) {
+        for (const sp of ps.spans) {
+          if (sec.s >= sp.sMin - 0.5 && sec.s <= sp.sMax + 0.5) {
+            if (Math.abs(sec.z - ps.padZMid) <= tolZ) return ps;
+          }
+        }
+      }
+      return null;
+    }
+
+    _hitTestCircSlice(sec) {
+      for (const cs of (this.lastCircSlices || [])) {
+        if (sec.s >= cs.sMin - 0.5 && sec.s <= cs.sMax + 0.5 && sec.z >= cs.zMin - 0.8 && sec.z <= cs.zMax + 1.2) {
+          return cs;
+        }
+      }
+      return null;
+    }
+
+    _drawTerrainModSlices(ctx, state, plane, basis, pal) {
+      this.lastPadSlices = [];
+      const mods = state.terrainMods || [];
+      if (mods.length === 0) return;
+      const eng = window.GROUNDWORK_ENGINE;
+      const siteTools = window.GROUNDWORK_SITE_TOOLS;
+      const isDark = state.theme === 'dark';
+
+      for (const mod of mods) {
+        const sl = siteTools.sliceTerrainModWithPlane(mod, plane);
+        if (!sl) continue;
+        const stats = siteTools.getPolygonStats(mod.pts);
+        const padZMid = mod.mode === 'offset' ? stats.avgOrigZ + (mod.deltaZ || 0) : mod.targetZ;
+        this.lastPadSlices.push({ mod, spans: sl.spans, padZMid });
+        const isSel = !!(state.selectedItem && state.selectedItem.kind === 'terrain' && state.selectedItem.id === mod.id);
+
+        if (state.layers.cutFill) {
+          for (const poly of sl.cutPolys) this._drawSoilPoly(ctx, poly, pal.cutFill, pal.cutStroke, +1);
+          for (const poly of sl.fillPolys) this._drawSoilPoly(ctx, poly, pal.fillFill, pal.fillStroke, -1);
+        }
+
+        // Draw dashed original terrain profile over cut span
+        ctx.save();
+        ctx.strokeStyle = pal.groundLine;
+        ctx.globalAlpha = 0.45;
+        ctx.setLineDash([4, 4]);
+        ctx.lineWidth = 1.2;
+        for (const sp of sl.spans) {
+          ctx.beginPath();
+          const n = 12;
+          for (let i = 0; i <= n; i++) {
+            const sv = sp.sMin + (sp.sMax - sp.sMin) * (i / n);
+            const wp = eng.planeToWorld(sv, 0, basis);
+            const oz = eng.getOriginalGroundZ(wp.x, wp.y);
+            const pt = this.secToScreen(sv, oz);
+            if (i === 0) ctx.moveTo(pt.x, pt.y);
+            else ctx.lineTo(pt.x, pt.y);
+          }
+          ctx.stroke();
+        }
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+
+        // Draw solid retaining wall bars at cut boundary stations
+        for (const ws of sl.wallStations) {
+          const pTop = this.secToScreen(ws.s - ws.thickness * 0.5, ws.zHigh);
+          const pBot = this.secToScreen(ws.s + ws.thickness * 0.5, ws.zLow);
+          const ww = Math.max(4, pBot.x - pTop.x);
+          const wh = Math.max(4, pBot.y - pTop.y);
+          ctx.fillStyle = isDark ? '#787166' : '#6e685d';
+          ctx.strokeStyle = isSel ? pal.ink : pal.groundLine;
+          ctx.lineWidth = isSel ? 1.8 : 1.1;
+          ctx.fillRect(pTop.x, pTop.y, ww, wh);
+          ctx.strokeRect(pTop.x, pTop.y, ww, wh);
+        }
+
+        // Pad grip handle for direct Section vertical push/pull
+        if (sl.spans.length > 0) {
+          const sp0 = sl.spans[0];
+          const midS = (sp0.sMin + sp0.sMax) * 0.5;
+          const wpMid = eng.planeToWorld(midS, 0, basis);
+          const padZ = eng.getGroundZ(wpMid.x, wpMid.y);
+          const gp = this.secToScreen(midS, padZ);
+          ctx.fillStyle = isSel ? pal.ink : pal.gripFill;
+          ctx.strokeStyle = pal.ink;
+          ctx.lineWidth = 1.3;
+          ctx.fillRect(gp.x - 5, gp.y - 5, 10, 10);
+          ctx.strokeRect(gp.x - 5, gp.y - 5, 10, 10);
+        }
+        ctx.restore();
+      }
+    }
+
+    _drawCirculationSlices(ctx, state, plane, pal) {
+      this.lastCircSlices = [];
+      const list = state.circulations || [];
+      if (list.length === 0) return;
+      const siteTools = window.GROUNDWORK_SITE_TOOLS;
+      const isDark = state.theme === 'dark';
+
+      for (const circ of list) {
+        const prof = siteTools.computeCirculationProfile(circ, state.volumes, state.useGross);
+        const sl = siteTools.sliceCirculationWithPlane(circ, prof, plane, plane.projDepth || 18);
+        if (!sl || !sl.topPts || sl.topPts.length < 2) continue;
+        this.lastCircSlices.push(sl);
+
+        const isSel = !!(state.selectedItem && state.selectedItem.kind === 'circulation' && state.selectedItem.id === circ.id);
+        const col = circ.kind === 'stair' ? (isDark ? '#8fa8b8' : '#4f6d82') : (isDark ? '#c9a66b' : '#8c6b32');
+        ctx.save();
+        if (sl.kind === 'projected') ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        sl.topPts.forEach((p, idx) => {
+          const sp = this.secToScreen(p.s, p.z);
+          if (idx === 0) ctx.moveTo(sp.x, sp.y);
+          else ctx.lineTo(sp.x, sp.y);
+        });
+        for (let i = sl.bottomPts.length - 1; i >= 0; i--) {
+          const sp = this.secToScreen(sl.bottomPts[i].s, sl.bottomPts[i].z);
+          ctx.lineTo(sp.x, sp.y);
+        }
+        ctx.closePath();
+        ctx.fillStyle = isDark ? 'rgba(200,190,170,0.22)' : 'rgba(90,85,75,0.20)';
+        ctx.strokeStyle = isSel ? pal.ink : col;
+        ctx.lineWidth = isSel ? 2.0 : 1.4;
+        ctx.fill();
+        ctx.stroke();
+
+        // Handrail line 1.0m above
+        if (circ.railing !== false) {
+          ctx.beginPath();
+          sl.topPts.forEach((p, idx) => {
+            const sp = this.secToScreen(p.s, p.z + 1.0);
+            if (idx === 0) ctx.moveTo(sp.x, sp.y);
+            else ctx.lineTo(sp.x, sp.y);
+          });
+          ctx.lineWidth = 1.0;
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
     }
 
     _esc(str) {

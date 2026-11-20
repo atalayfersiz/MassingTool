@@ -1,27 +1,180 @@
 /* Geometric, Terrain, Earthwork Cut/Fill, and Clipping-Plane Section Engine */
 (function () {
+  let _activeTerrainMods = [];
+  let _gradedZ = null;
+  let _terrainVersion = 0;
+
   function getSite() {
     return window.GROUNDWORK_SITE;
   }
 
-  function getGroundZ(x, y) {
-    const site = getSite();
-    if (!site || !site.heightfield) return 1975.0;
-    const hf = site.heightfield;
+  function pointInPolygon(x, y, poly) {
+    if (!poly || poly.length < 3) return false;
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const pi = poly[i];
+      const pj = poly[j];
+      const xi = Array.isArray(pi) ? pi[0] : pi.x;
+      const yi = Array.isArray(pi) ? pi[1] : pi.y;
+      const xj = Array.isArray(pj) ? pj[0] : pj.x;
+      const yj = Array.isArray(pj) ? pj[1] : pj.y;
+      const intersect = ((yi > y) !== (yj > y)) &&
+        (x < ((xj - xi) * (y - yi)) / ((yj - yi) || 1e-12) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  function distPointToPolygonEdge(x, y, poly) {
+    if (!poly || poly.length < 2) return Infinity;
+    let best = Infinity;
+    const p = { x, y };
+    for (let i = 0; i < poly.length; i++) {
+      const pa = poly[i];
+      const pb = poly[(i + 1) % poly.length];
+      const a = { x: Array.isArray(pa) ? pa[0] : pa.x, y: Array.isArray(pa) ? pa[1] : pa.y };
+      const b = { x: Array.isArray(pb) ? pb[0] : pb.x, y: Array.isArray(pb) ? pb[1] : pb.y };
+      const d = distPointToSegment(p, a, b);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  function sampleHeightfieldArray(zArr, hf, x, y) {
     const fx = (x - hf.minX) / hf.cellSize;
     const fy = (y - hf.minY) / hf.cellSize;
     const ix = Math.max(0, Math.min(hf.nx - 2, Math.floor(fx)));
     const iy = Math.max(0, Math.min(hf.ny - 2, Math.floor(fy)));
     const tx = Math.max(0, Math.min(1, fx - ix));
     const ty = Math.max(0, Math.min(1, fy - iy));
-    const z = hf.z;
     const row0 = iy * hf.nx;
     const row1 = (iy + 1) * hf.nx;
-    const z00 = z[row0 + ix];
-    const z10 = z[row0 + ix + 1];
-    const z01 = z[row1 + ix];
-    const z11 = z[row1 + ix + 1];
+    const z00 = zArr[row0 + ix];
+    const z10 = zArr[row0 + ix + 1];
+    const z01 = zArr[row1 + ix];
+    const z11 = zArr[row1 + ix + 1];
     return (z00 * (1 - tx) + z10 * tx) * (1 - ty) + (z01 * (1 - tx) + z11 * tx) * ty;
+  }
+
+  function _ensureModBBox(mod) {
+    if (mod._bbox) return mod._bbox;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const pt of (mod.pts || [])) {
+      const px = Array.isArray(pt) ? pt[0] : pt.x;
+      const py = Array.isArray(pt) ? pt[1] : pt.y;
+      if (px < minX) minX = px;
+      if (px > maxX) maxX = px;
+      if (py < minY) minY = py;
+      if (py > maxY) maxY = py;
+    }
+    const pad = Math.max(0, Number(mod.batterSlope) || 0) + 0.5;
+    mod._bbox = { minX: minX - pad, maxX: maxX + pad, minY: minY - pad, maxY: maxY + pad };
+    return mod._bbox;
+  }
+
+  function _evalTerrainModsAt(x, y, baseZ) {
+    let z = baseZ;
+    for (const mod of _activeTerrainMods) {
+      if (!mod || !mod.pts || mod.pts.length < 3) continue;
+      const bb = _ensureModBBox(mod);
+      if (x < bb.minX || x > bb.maxX || y < bb.minY || y > bb.maxY) continue;
+      const targetVal = mod.mode === 'offset' ? (z + (Number(mod.deltaZ) || 0)) : Number(mod.targetZ);
+      if (!Number.isFinite(targetVal)) continue;
+      if (pointInPolygon(x, y, mod.pts)) {
+        z = targetVal;
+      } else {
+        const batter = Math.max(0, Number(mod.batterSlope) || 0);
+        if (batter > 0.05) {
+          const d = distPointToPolygonEdge(x, y, mod.pts);
+          if (d < batter) {
+            const t = d / batter;
+            z = targetVal * (1 - t) + z * t;
+          }
+        }
+      }
+    }
+    return z;
+  }
+
+  function getOriginalGroundZ(x, y) {
+    const site = getSite();
+    if (!site || !site.heightfield) return 1975.0;
+    return sampleHeightfieldArray(site.heightfield.z, site.heightfield, x, y);
+  }
+
+  function getGroundZ(x, y) {
+    const site = getSite();
+    if (!site || !site.heightfield) return 1975.0;
+    const hf = site.heightfield;
+    const origZ = sampleHeightfieldArray(hf.z, hf, x, y);
+    if (_activeTerrainMods.length === 0) return origZ;
+    return _evalTerrainModsAt(x, y, origZ);
+  }
+
+  function setTerrainMods(mods) {
+    _activeTerrainMods = Array.isArray(mods) ? mods : [];
+    for (const m of _activeTerrainMods) {
+      if (m) delete m._bbox;
+    }
+    _terrainVersion++;
+    for (const k of Object.keys(_contourCache)) {
+      delete _contourCache[k];
+    }
+
+    const site = getSite();
+    if (!site || !site.heightfield) {
+      _gradedZ = null;
+      return;
+    }
+    const hf = site.heightfield;
+    if (_activeTerrainMods.length === 0) {
+      _gradedZ = null;
+      return;
+    }
+    if (!_gradedZ || _gradedZ.length !== hf.z.length) {
+      _gradedZ = new Float32Array(hf.z.length);
+    }
+    _gradedZ.set(hf.z);
+
+    for (const mod of _activeTerrainMods) {
+      if (!mod || !mod.pts || mod.pts.length < 3) continue;
+      const bb = _ensureModBBox(mod);
+      const ix0 = Math.max(0, Math.floor((bb.minX - hf.minX) / hf.cellSize) - 1);
+      const ix1 = Math.min(hf.nx - 1, Math.ceil((bb.maxX - hf.minX) / hf.cellSize) + 1);
+      const iy0 = Math.max(0, Math.floor((bb.minY - hf.minY) / hf.cellSize) - 1);
+      const iy1 = Math.min(hf.ny - 1, Math.ceil((bb.maxY - hf.minY) / hf.cellSize) + 1);
+      for (let iy = iy0; iy <= iy1; iy++) {
+        const wy = hf.minY + iy * hf.cellSize;
+        const row = iy * hf.nx;
+        for (let ix = ix0; ix <= ix1; ix++) {
+          const wx = hf.minX + ix * hf.cellSize;
+          const curZ = _gradedZ[row + ix];
+          const targetVal = mod.mode === 'offset' ? (curZ + (Number(mod.deltaZ) || 0)) : Number(mod.targetZ);
+          if (!Number.isFinite(targetVal)) continue;
+          if (pointInPolygon(wx, wy, mod.pts)) {
+            _gradedZ[row + ix] = targetVal;
+          } else {
+            const batter = Math.max(0, Number(mod.batterSlope) || 0);
+            if (batter > 0.05) {
+              const d = distPointToPolygonEdge(wx, wy, mod.pts);
+              if (d < batter) {
+                const t = d / batter;
+                _gradedZ[row + ix] = targetVal * (1 - t) + curZ * t;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  function getTerrainVersion() {
+    return _terrainVersion;
+  }
+
+  function getGradedHeightfieldZ() {
+    const site = getSite();
+    return _gradedZ || (site && site.heightfield ? site.heightfield.z : null);
   }
 
   function getEffectiveDims(vol, useGross) {
@@ -635,6 +788,8 @@
     if (_contourCache[interval]) return _contourCache[interval];
     const site = getSite();
     if (!site || !site.heightfield) return [];
+    const zArr = getGradedHeightfieldZ();
+    if (!zArr) return [];
     const hf = site.heightfield;
     const zMin = Math.ceil(site.meta.zMin / interval) * interval;
     const zMax = Math.floor(site.meta.zMax / interval) * interval;
@@ -650,10 +805,10 @@
         for (let ix = 0; ix < hf.nx - 1; ix++) {
           const x0 = hf.minX + ix * hf.cellSize;
           const x1 = x0 + hf.cellSize;
-          const z0 = hf.z[r0 + ix];
-          const z1 = hf.z[r0 + ix + 1];
-          const z2 = hf.z[r1 + ix + 1];
-          const z3 = hf.z[r1 + ix];
+          const z0 = zArr[r0 + ix];
+          const z1 = zArr[r0 + ix + 1];
+          const z2 = zArr[r1 + ix + 1];
+          const z3 = zArr[r1 + ix];
           const mask = (z0 >= level ? 1 : 0) | (z1 >= level ? 2 : 0) | (z2 >= level ? 4 : 0) | (z3 >= level ? 8 : 0);
           if (mask === 0 || mask === 15) continue;
 
@@ -735,12 +890,20 @@
 
   window.GROUNDWORK_ENGINE = {
     getGroundZ,
+    getOriginalGroundZ,
+    setTerrainMods,
+    getTerrainVersion,
+    getGradedHeightfieldZ,
     getEffectiveDims,
     getRoofSpec,
     getRoofRiseAtLocal,
     getRoofApexRise,
     getFootprintCorners,
     pointInFootprint,
+    pointInPolygon,
+    distPointToPolygonEdge,
+    distPointToSegment,
+    polygonsOverlap,
     pointInSiteBoundary,
     isBuildingInsidePlot,
     minEdgeDistanceRects,

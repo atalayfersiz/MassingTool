@@ -24,11 +24,14 @@
         </div>
         <div class="sep"></div>
         <div class="segmented" id="toolSwitch">
-          <button class="seg-btn active" data-tool="select" title="Select, Move, Resize, Edit Height (V)">Select</button>
+          <button class="seg-btn active" data-tool="select" title="Select, Move, Resize, Box Select (V)">Select</button>
+          <button class="seg-btn" data-tool="terrain" title="Grade Terrain: Flatten, Lift or Dig with Retaining Walls (P)">Pad</button>
+          <button class="seg-btn" data-tool="ramp" title="Draw Parametric Ramp Border (K)">Ramp</button>
+          <button class="seg-btn" data-tool="stair" title="Draw Parametric Stair Border (J)">Stair</button>
+          <button class="seg-btn" data-tool="section" title="Draw or move Section Clipping Plane on Plan (C)">Section</button>
           <button class="seg-btn" data-tool="dimension" title="Measure distance &amp; elevation across Plan, 3D, Section (D)">Dim</button>
           <button class="seg-btn" data-tool="line" title="Draw Line / Arrow annotation (L)">Line</button>
           <button class="seg-btn" data-tool="text" title="Add Text annotation (A)">Text</button>
-          <button class="seg-btn" data-tool="section" title="Draw or move Section Clipping Plane on Plan (C)">Section</button>
         </div>
       </div>
 
@@ -94,11 +97,19 @@
             </div>
             <div class="vp-controls">
               <button class="vp-btn active" id="btnToggleSnap" title="Toggle Magnetic Snap &amp; Alignment Guides (S · Hold Alt to bypass)">Snap</button>
+              <button class="vp-btn" id="btnPlanRainToggle" title="Toggle Rainwater Flow &amp; Collection Analysis (W)">Rain</button>
               <button class="vp-btn active" id="btnToggleRectDims" title="Show rectangle dimensions when zoomed in (R)">Rect Dims</button>
               <button class="vp-btn active" id="btnPlanAnnToggle" title="Toggle Text &amp; Line annotations">Annotations</button>
               <button class="vp-btn" id="btnShowDock" style="display:none;" title="Show Program Bar (B)">Program Bar</button>
               <button class="vp-btn" id="btnPlanFit" title="Fit Site (F)">Fit Site</button>
             </div>
+          </div>
+          <div class="plan-draw-bar" id="planDrawBar" style="display:none;">
+            <div class="segmented" id="terrainShapeSwitch">
+              <button type="button" class="seg-btn active" data-shape="rect">Rectangle</button>
+              <button type="button" class="seg-btn" data-shape="poly">Polygon</button>
+            </div>
+            <span id="planDrawHint" style="color:var(--ink-muted);font-size:11px;"></span>
           </div>
           <div class="vp-bottom-hud">
             <div class="vp-readout" id="cursorReadout">X: 0.0 m · Y: 0.0 m · Ground Z: — m</div>
@@ -109,6 +120,7 @@
         <div class="viewport vp-3d" id="vp3d">
           <div id="view3dContainer" style="width:100%;height:100%;position:relative;">
             <div class="labels-3d-layer" id="labels3dLayer"></div>
+            <div class="marquee-3d-box" id="marquee3dBox"></div>
           </div>
           <div class="vp-hud">
             <div class="vp-tag">
@@ -116,8 +128,10 @@
               <span id="vp3dOrbitHint" style="color:var(--ink-muted);font-weight:400;">Click space to orbit around it &amp; edit XYZ</span>
             </div>
             <div class="vp-controls">
-              <button class="vp-btn" id="btn3dTranslucent" title="Toggle Translucent Ground (T)">Translucent Ground</button>
-              <button class="vp-btn active" id="btn3dClipToggle" title="Toggle 3D Clipping Plane (Shift+C)">Clip Plane</button>
+              <button class="vp-btn active" id="btn3dSnapToggle" title="Toggle 3D Magnetic Snap (S · Hold Alt to bypass)">Snap</button>
+              <button class="vp-btn" id="btn3dBoxSelect" title="3D Rectangle Box Select (U · or Shift+Drag anytime · L→R Window / R→L Crossing)">Box</button>
+              <button class="vp-btn" id="btn3dTranslucent" title="Toggle Translucent Ground (T)">X-Ray</button>
+              <button class="vp-btn active" id="btn3dClipToggle" title="Toggle 3D Clipping Plane (Shift+C)">Clip</button>
               <button class="vp-btn" id="btn3dFit" title="Fit 3D Site (F)">Fit 3D</button>
             </div>
           </div>
@@ -147,8 +161,9 @@
         <div class="sidebar-tabs" id="sidebarTabs">
           <button class="tab-btn active" data-tab="selected">Selected</button>
           <button class="tab-btn" data-tab="keywords">Keywords</button>
-          <button class="tab-btn" data-tab="sections">Sections &amp; Layers</button>
-          <button class="tab-btn" data-tab="iterations">Iterations</button>
+          <button class="tab-btn" data-tab="sections">Layers</button>
+          <button class="tab-btn" data-tab="rain">Rain</button>
+          <button class="tab-btn" data-tab="iterations">Iter.</button>
         </div>
         <div class="sidebar-body" id="sidebarBody"></div>
       </aside>
@@ -226,7 +241,11 @@
           <div class="modal-group">
             <div class="modal-group-title">Tools &amp; Views</div>
             <div class="shortcut-list">
-              <div class="shortcut-row"><span>Select / Move</span><span class="kbd">V</span></div>
+              <div class="shortcut-row"><span>Select / Box Select</span><span class="kbd">V (U in 3D / Shift)</span></div>
+              <div class="shortcut-row"><span>Pad / Grade Terrain</span><span class="kbd">P</span></div>
+              <div class="shortcut-row"><span>Parametric Ramp / Stair</span><span class="kbd">K / J</span></div>
+              <div class="shortcut-row"><span>Rainwater Flow Analysis</span><span class="kbd">W</span></div>
+              <div class="shortcut-row"><span>Box Select Window / Cross</span><span class="kbd">L→R / R→L Drag</span></div>
               <div class="shortcut-row"><span>Dimension tool</span><span class="kbd">D</span></div>
               <div class="shortcut-row"><span>Line / Arrow tool</span><span class="kbd">L</span></div>
               <div class="shortcut-row"><span>Text annotation tool</span><span class="kbd">A</span></div>
@@ -347,6 +366,7 @@
   <script src="site-data.js"></script>
   <script src="program-data.js"></script>
   <script src="engine-earthwork.js"></script>
+  <script src="engine-site-tools.js"></script>
   <script src="view-plan.js"></script>
   <script src="view-3d.js"></script>
   <script src="view-section.js"></script>

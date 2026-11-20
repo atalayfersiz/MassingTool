@@ -4,6 +4,7 @@
 
   const prog = window.GROUNDWORK_PROGRAM;
   const eng = window.GROUNDWORK_ENGINE;
+  const siteTools = window.GROUNDWORK_SITE_TOOLS;
   const site = window.GROUNDWORK_SITE;
   const catalog = prog.createCatalogSpaces();
   const catalogById = new Map(catalog.map(s => [s.id, s]));
@@ -44,6 +45,10 @@
       activePlaneId: 'sec-A',
       dimensions: [],
       annotations: [],
+      terrainMods: [],
+      circulations: [],
+      terrainDrawShape: 'rect',
+      rainConfig: { intensityMmHr: 50, durationHr: 1.0, annualMm: 1600 },
       layers: {
         siteBoundary: true,
         contours: true,
@@ -56,7 +61,8 @@
         translucentTerrain: false,
         rectDims: true,
         annotations: true,
-        snap: true
+        snap: true,
+        rainwater: false
       },
       iterations: [],
       nextGroupNum: 1,
@@ -113,6 +119,10 @@
       selectedItem: s.selectedItem && s.selectedItem.kind ? s.selectedItem : null,
       dimensions: Array.isArray(s.dimensions) ? s.dimensions : [],
       annotations: Array.isArray(s.annotations) ? s.annotations : [],
+      terrainMods: Array.isArray(s.terrainMods) ? s.terrainMods.map(m => siteTools.normalizeTerrainMod(m)) : [],
+      circulations: Array.isArray(s.circulations) ? s.circulations.map(c => siteTools.normalizeCirculation(c)) : [],
+      terrainDrawShape: s.terrainDrawShape === 'poly' ? 'poly' : 'rect',
+      rainConfig: { ...def.rainConfig, ...(s.rainConfig || {}) },
       iterations: Array.isArray(s.iterations) ? s.iterations : [],
       nextCustomNum: Number.isFinite(s.nextCustomNum) ? s.nextCustomNum : 1
     };
@@ -132,6 +142,8 @@
       activePlaneId: state.activePlaneId,
       dimensions: state.dimensions,
       annotations: state.annotations,
+      terrainMods: state.terrainMods,
+      circulations: state.circulations,
       keywords: state.keywords,
       selectedIds: state.selectedIds,
       selectedItem: state.selectedItem,
@@ -696,6 +708,87 @@
     refreshAll({ forceSidebar: true });
   }
 
+  function addTerrainMod(raw) {
+    pushUndo();
+    const mod = siteTools.normalizeTerrainMod({
+      ...raw,
+      name: raw && raw.name ? raw.name : `Pad ${state.terrainMods.length + 1}`
+    });
+    state.terrainMods.push(mod);
+    state.selectedIds = [];
+    state.selectedItem = { kind: 'terrain', id: mod.id };
+    state.sidebarTab = 'selected';
+    refreshAll({ forceSidebar: true });
+    return mod;
+  }
+
+  function updateTerrainMod(id, patch, opts = {}) {
+    const idx = state.terrainMods.findIndex(m => m.id === id);
+    if (idx < 0) return;
+    if (!opts.silentUndo) pushUndo();
+    const next = siteTools.normalizeTerrainMod({ ...state.terrainMods[idx], ...patch, id });
+    state.terrainMods[idx] = next;
+    refreshAll(opts);
+  }
+
+  function deleteTerrainMod(id) {
+    pushUndo();
+    state.terrainMods = state.terrainMods.filter(m => m.id !== id);
+    if (state.selectedItem && state.selectedItem.kind === 'terrain' && state.selectedItem.id === id) {
+      state.selectedItem = null;
+    }
+    refreshAll({ forceSidebar: true });
+    toast('Deleted terrain pad');
+  }
+
+  function addCirculation(raw) {
+    pushUndo();
+    const count = state.circulations.length + 1;
+    const defaultName = raw && raw.kind === 'stair' ? `Stair ${count}` : `Ramp ${count}`;
+    const circ = siteTools.normalizeCirculation({
+      ...raw,
+      name: raw && raw.name ? raw.name : defaultName
+    });
+    state.circulations.push(circ);
+    state.selectedIds = [];
+    state.selectedItem = { kind: 'circulation', id: circ.id };
+    state.sidebarTab = 'selected';
+    refreshAll({ forceSidebar: true });
+    return circ;
+  }
+
+  function updateCirculation(id, patch, opts = {}) {
+    const idx = state.circulations.findIndex(c => c.id === id);
+    if (idx < 0) return;
+    if (!opts.silentUndo) pushUndo();
+    const next = siteTools.normalizeCirculation({ ...state.circulations[idx], ...patch, id });
+    state.circulations[idx] = next;
+    refreshAll(opts);
+  }
+
+  function deleteCirculation(id) {
+    pushUndo();
+    state.circulations = state.circulations.filter(c => c.id !== id);
+    if (state.selectedItem && state.selectedItem.kind === 'circulation' && state.selectedItem.id === id) {
+      state.selectedItem = null;
+    }
+    refreshAll({ forceSidebar: true });
+    toast(`Deleted ramp/stair`);
+  }
+
+  let _rainCacheKey = '';
+  let _rainCacheVal = null;
+  function getRainwaterAnalysis() {
+    const volSig = state.volumes.map(v => `${v.id}:${v.x.toFixed(1)},${v.y.toFixed(1)},${v.w.toFixed(1)},${v.d.toFixed(1)}`).join('|');
+    const circSig = state.circulations.map(c => `${c.id}:${c.x.toFixed(1)},${c.y.toFixed(1)},${c.length.toFixed(1)},${c.width.toFixed(1)}`).join('|');
+    const cfg = state.rainConfig || {};
+    const key = `${eng.getTerrainVersion()}|${state.useGross}|${cfg.intensityMmHr}|${cfg.durationHr}|${cfg.annualMm}|${volSig}|${circSig}`;
+    if (_rainCacheVal && _rainCacheKey === key) return _rainCacheVal;
+    _rainCacheKey = key;
+    _rainCacheVal = siteTools.computeRainwaterAnalysis(state);
+    return _rainCacheVal;
+  }
+
   function addAnnotation(ann) {
     pushUndo();
     state.layers.annotations = true;
@@ -866,6 +959,8 @@
     state.selectedItem = null;
     state.dimensions = [];
     state.annotations = [];
+    state.terrainMods = [];
+    state.circulations = [];
     refreshAll({ forceSidebar: true });
     toast('Board cleared');
   }
@@ -894,6 +989,14 @@
     addAnnotation,
     updateAnnotation,
     deleteAnnotation,
+    addTerrainMod,
+    updateTerrainMod,
+    deleteTerrainMod,
+    addCirculation,
+    updateCirculation,
+    deleteCirculation,
+    getRainwaterAnalysis,
+    setTool,
     openInlineTextEditor,
     updateCursorReadout: (pt) => {
       const el = document.getElementById('cursorReadout');
@@ -912,6 +1015,7 @@
   const sectionView = new window.GroundworkSectionView(document.getElementById('sectionCanvas'), api);
 
   function refreshAll(opts = {}) {
+    eng.setTerrainMods(state.terrainMods || []);
     persistAuto();
     updateTopBarMetrics();
     renderProgramDock();
@@ -940,6 +1044,17 @@
         placedNet += v.area;
       }
       const ew = eng.computeEarthwork(v, state.useGross, 14);
+      totalCut += ew.cutVol;
+      totalFill += ew.fillVol;
+    }
+    for (const m of (state.terrainMods || [])) {
+      const ew = siteTools.computeTerrainModEarthwork(m);
+      totalCut += ew.cutVol;
+      totalFill += ew.fillVol;
+    }
+    for (const c of (state.circulations || [])) {
+      const prof = siteTools.computeCirculationProfile(c, state.volumes, state.useGross);
+      const ew = siteTools.computeCirculationEarthwork(c, prof);
       totalCut += ew.cutVol;
       totalFill += ew.fillVol;
     }
@@ -979,9 +1094,40 @@
     const snapEnabled = state.layers.snap !== false;
     const snapBtn = document.getElementById('btnToggleSnap');
     if (snapBtn) snapBtn.classList.toggle('active', snapEnabled);
+    const snap3dBtn = document.getElementById('btn3dSnapToggle');
+    if (snap3dBtn) snap3dBtn.classList.toggle('active', snapEnabled);
     const secSnapBtn = document.getElementById('btnSecSnapToggle');
     if (secSnapBtn) secSnapBtn.classList.toggle('active', snapEnabled);
+    const rainBtn = document.getElementById('btnPlanRainToggle');
+    if (rainBtn) rainBtn.classList.toggle('active', !!state.layers.rainwater);
+    const box3dBtn = document.getElementById('btn3dBoxSelect');
+    if (box3dBtn) box3dBtn.classList.toggle('active', !!(view3D && view3D.boxSelectMode));
     const rectDimBtn = document.getElementById('btnToggleRectDims');
+
+    const drawBar = document.getElementById('planDrawBar');
+    if (drawBar) {
+      const isDraw = state.tool === 'terrain' || state.tool === 'ramp' || state.tool === 'stair';
+      drawBar.style.display = isDraw ? 'inline-flex' : 'none';
+      const shapeSw = document.getElementById('terrainShapeSwitch');
+      if (shapeSw) {
+        shapeSw.style.display = state.tool === 'terrain' ? 'inline-flex' : 'none';
+        shapeSw.querySelectorAll('.seg-btn').forEach(b => {
+          b.classList.toggle('active', b.dataset.shape === state.terrainDrawShape);
+        });
+      }
+      const hint = document.getElementById('planDrawHint');
+      if (hint) {
+        if (state.tool === 'terrain') {
+          hint.textContent = state.terrainDrawShape === 'poly'
+            ? 'Click corners · Double-click or click start to close pad'
+            : 'Drag rectangle on Plan to grade & build retaining walls';
+        } else if (state.tool === 'ramp') {
+          hint.textContent = 'Drag start to end on Plan to place parametric ramp';
+        } else if (state.tool === 'stair') {
+          hint.textContent = 'Drag start to end on Plan to place parametric stair';
+        }
+      }
+    }
     if (rectDimBtn) rectDimBtn.classList.toggle('active', !!state.layers.rectDims);
     const planAnnBtn = document.getElementById('btnPlanAnnToggle');
     if (planAnnBtn) planAnnBtn.classList.toggle('active', !!state.layers.annotations);
@@ -1087,6 +1233,7 @@
     if (state.sidebarTab === 'selected') renderTabSelected(body);
     else if (state.sidebarTab === 'keywords') renderTabKeywords(body);
     else if (state.sidebarTab === 'sections') renderTabSections(body);
+    else if (state.sidebarTab === 'rain') renderTabRainwater(body);
     else renderTabIterations(body);
   }
 
@@ -1280,6 +1427,325 @@
     document.getElementById('btnDelSelectedText').addEventListener('click', () => deleteAnnotation(ann.id));
   }
 
+  function renderSelectedTerrainMod(body, mod) {
+    const ew = siteTools.computeTerrainModEarthwork(mod);
+    const isOff = mod.mode === 'offset';
+    const refAvg = ew.avgOrigZ;
+    const curVal = isOff ? (mod.deltaZ || 0) : mod.targetZ;
+    const relOffset = isOff ? curVal : (curVal - refAvg);
+
+    body.innerHTML = `
+      <div class="panel-section">
+        <div class="panel-title">
+          <span>Terrain Grading Pad (${mod.shape === 'poly' ? 'Polygon' : 'Rectangle'})</span>
+          <span>${ew.padArea.toFixed(0)} m²</span>
+        </div>
+        <div class="field">
+          <label>Name</label>
+          <input type="text" id="inPadName" value="${escapeHtml(mod.name || 'Terrain Pad')}" />
+        </div>
+        <div class="field">
+          <label>Grading Operation</label>
+          <div class="segmented" style="display:flex;">
+            <button type="button" class="seg-btn ${!isOff ? 'active' : ''}" data-padmode="flatten" style="flex:1;">Flatten Level</button>
+            <button type="button" class="seg-btn ${isOff ? 'active' : ''}" data-padmode="offset" style="flex:1;">Lift / Dig (ΔZ)</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>${isOff ? `Push / Pull Offset ΔZ (${curVal >= 0 ? '+' : ''}${curVal.toFixed(2)} m)` : `Pad Elevation (m MSL · ${relOffset >= 0 ? '+' : ''}${relOffset.toFixed(1)}m vs avg)`}</label>
+          <input type="range" id="rngPadVal" min="${isOff ? -10 : Math.floor(refAvg - 10)}" max="${isOff ? 10 : Math.ceil(refAvg + 10)}" step="0.1" value="${curVal.toFixed(1)}" />
+          <div class="row-between" style="gap:4px;">
+            <input type="number" id="inPadVal" step="0.2" value="${curVal.toFixed(2)}" style="flex:1;" />
+            <button type="button" class="btn align-btn" data-nudge="-1">-1m</button>
+            <button type="button" class="btn align-btn" data-nudge="-0.5">-0.5</button>
+            <button type="button" class="btn align-btn" id="btnPadAvg">0/Avg</button>
+            <button type="button" class="btn align-btn" data-nudge="0.5">+0.5</button>
+            <button type="button" class="btn align-btn" data-nudge="1">+1m</button>
+          </div>
+        </div>
+        <label class="kw-check-row">
+          <span class="kw-check-left"><input type="checkbox" id="chkPadRetain" ${mod.retainingWalls !== false ? 'checked' : ''} /><span>Build Retaining Walls Around Border</span></span>
+        </label>
+        <div class="field-grid">
+          <div class="field">
+            <label>Wall Thick (m)</label>
+            <input type="number" id="inPadWallT" step="0.05" min="0.15" max="1.5" value="${(mod.wallThickness || 0.35).toFixed(2)}" />
+          </div>
+          <div class="field">
+            <label>Parapet Lip (m)</label>
+            <input type="number" id="inPadParapet" step="0.05" min="0" max="2.5" value="${(mod.parapetHeight || 0.25).toFixed(2)}" />
+          </div>
+          <div class="field" style="grid-column:span 2;">
+            <label>Slope Transition Batter (0 = vertical wall, m)</label>
+            <input type="number" id="inPadBatter" step="0.5" min="0" max="12" value="${(mod.batterSlope || 0).toFixed(1)}" />
+          </div>
+        </div>
+      </div>
+      <div class="panel-section">
+        <div class="panel-title">Pad Earthwork &amp; Retaining Walls</div>
+        <div class="earth-box">
+          <div class="earth-stat"><div class="k">Cut Soil</div><div class="v m-cut">${ew.cutVol.toFixed(1)} m³</div></div>
+          <div class="earth-stat"><div class="k">Fill Soil</div><div class="v m-fill">${ew.fillVol.toFixed(1)} m³</div></div>
+          <div class="earth-stat"><div class="k">Max Wall H</div><div class="v">${ew.maxWallHeight.toFixed(2)} m</div></div>
+          <div class="earth-stat"><div class="k">Wall Surface</div><div class="v">${ew.wallArea.toFixed(0)} m²</div></div>
+        </div>
+        <div class="row-between">
+          <button type="button" class="btn" id="btnPadDone" style="flex:1">Done</button>
+          <button type="button" class="btn danger" id="btnPadDel">Delete Pad</button>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('inPadName').addEventListener('change', (e) => {
+      updateTerrainMod(mod.id, { name: e.target.value }, { forceSidebar: true });
+    });
+    body.querySelectorAll('[data-padmode]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const nextMode = btn.dataset.padmode;
+        if (nextMode === 'offset') {
+          updateTerrainMod(mod.id, { mode: 'offset', deltaZ: Math.round((mod.targetZ - refAvg) * 100) / 100 }, { forceSidebar: true });
+        } else {
+          updateTerrainMod(mod.id, { mode: 'flatten', targetZ: Math.round((refAvg + (mod.deltaZ || 0)) * 100) / 100 }, { forceSidebar: true });
+        }
+      });
+    });
+    let padSliderUndo = false;
+    document.getElementById('rngPadVal').addEventListener('input', (e) => {
+      if (!padSliderUndo) { pushUndo(); padSliderUndo = true; }
+      const v = parseFloat(e.target.value) || 0;
+      updateTerrainMod(mod.id, isOff ? { deltaZ: v } : { targetZ: v }, { silentUndo: true });
+    });
+    document.getElementById('rngPadVal').addEventListener('change', () => { padSliderUndo = false; refreshAll({ forceSidebar: true }); });
+    document.getElementById('inPadVal').addEventListener('change', (e) => {
+      const v = parseFloat(e.target.value) || 0;
+      updateTerrainMod(mod.id, isOff ? { deltaZ: v } : { targetZ: v }, { forceSidebar: true });
+    });
+    body.querySelectorAll('[data-nudge]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const d = parseFloat(btn.dataset.nudge);
+        const nv = Math.round(((isOff ? mod.deltaZ : mod.targetZ) + d) * 100) / 100;
+        updateTerrainMod(mod.id, isOff ? { deltaZ: nv } : { targetZ: nv }, { forceSidebar: true });
+      });
+    });
+    document.getElementById('btnPadAvg').addEventListener('click', () => {
+      updateTerrainMod(mod.id, isOff ? { deltaZ: 0 } : { targetZ: Math.round(refAvg * 100) / 100 }, { forceSidebar: true });
+    });
+    document.getElementById('chkPadRetain').addEventListener('change', (e) => {
+      updateTerrainMod(mod.id, { retainingWalls: e.target.checked }, { forceSidebar: true });
+    });
+    document.getElementById('inPadWallT').addEventListener('change', (e) => {
+      updateTerrainMod(mod.id, { wallThickness: parseFloat(e.target.value) || 0.35 }, { forceSidebar: true });
+    });
+    document.getElementById('inPadParapet').addEventListener('change', (e) => {
+      updateTerrainMod(mod.id, { parapetHeight: parseFloat(e.target.value) || 0 }, { forceSidebar: true });
+    });
+    document.getElementById('inPadBatter').addEventListener('change', (e) => {
+      updateTerrainMod(mod.id, { batterSlope: parseFloat(e.target.value) || 0 }, { forceSidebar: true });
+    });
+    document.getElementById('btnPadDone').addEventListener('click', clearSelection);
+    document.getElementById('btnPadDel').addEventListener('click', () => deleteTerrainMod(mod.id));
+  }
+
+  function renderSelectedCirculation(body, circ) {
+    const prof = siteTools.computeCirculationProfile(circ, state.volumes, state.useGross);
+    const ew = siteTools.computeCirculationEarthwork(circ, prof);
+    const isStair = circ.kind === 'stair';
+    const isOk = isStair ? prof.compliance.includes('OK') : prof.slopePct <= 8.35;
+
+    const paramHtml = isStair ? `
+      <div class="field-grid">
+        <div class="field">
+          <label>Target Riser (m)</label>
+          <input type="number" id="inCircRiser" step="0.005" min="0.10" max="0.24" value="${(circ.riserHeight || 0.165).toFixed(3)}" />
+        </div>
+        <div class="field">
+          <label>Pref Tread (m)</label>
+          <input type="number" id="inCircTread" step="0.01" min="0.22" max="0.55" value="${(circ.treadDepth || 0.30).toFixed(2)}" />
+        </div>
+        <div class="field">
+          <label>Landing Every (steps)</label>
+          <input type="number" id="inCircLandInt" step="1" min="0" max="30" value="${circ.landingInterval || 12}" />
+        </div>
+        <div class="field">
+          <label>Landing Len (m)</label>
+          <input type="number" id="inCircLandLen" step="0.1" min="0.9" max="3.5" value="${(circ.landingLength || 1.4).toFixed(1)}" />
+        </div>
+      </div>
+      <div class="row-between">
+        <span class="compliance-pill ${isOk ? 'ok' : 'warn'}">${prof.riserCount}R × ${(prof.actualRiser * 100).toFixed(1)}cm · T ${(prof.actualTread * 100).toFixed(1)}cm · ${escapeHtml(prof.compliance)}</span>
+      </div>
+      <button type="button" class="btn" id="btnCircFitLen">Fit Length for Treads (${prof.recommendedLength.toFixed(1)} m)</button>
+    ` : `
+      <div class="field-grid">
+        <div class="field">
+          <label>Target Max Slope (%)</label>
+          <input type="number" id="inCircTargetSlope" step="0.5" min="1" max="25" value="${(circ.targetSlopePct || 8.0).toFixed(1)}" />
+        </div>
+        <div class="field">
+          <label>Max Run / Flight (m)</label>
+          <input type="number" id="inCircMaxRun" step="0.5" min="0" max="30" value="${(circ.maxRunBeforeLanding || 9.0).toFixed(1)}" />
+        </div>
+        <div class="field">
+          <label>Landing Len (m)</label>
+          <input type="number" id="inCircLandLen" step="0.1" min="0.9" max="3.5" value="${(circ.landingLength || 1.4).toFixed(1)}" />
+        </div>
+        <div class="field">
+          <label>Slab Thick (m)</label>
+          <input type="number" id="inCircSlabT" step="0.05" min="0.12" max="0.8" value="${(circ.slabThickness || 0.25).toFixed(2)}" />
+        </div>
+      </div>
+      <div class="row-between">
+        <span class="compliance-pill ${isOk ? 'ok' : 'warn'}">Slope ${prof.slopePct.toFixed(1)}% (1:${Number.isFinite(prof.ratio) ? prof.ratio.toFixed(1) : '∞'}) · ${escapeHtml(prof.compliance)}</span>
+      </div>
+      <button type="button" class="btn" id="btnCircFitLen">Fit Length for ${circ.targetSlopePct.toFixed(1)}% Slope (${prof.recommendedLength.toFixed(1)} m)</button>
+    `;
+
+    body.innerHTML = `
+      <div class="panel-section">
+        <div class="panel-title">
+          <span>Parametric ${isStair ? 'Stair' : 'Ramp'}</span>
+          <span>ΔZ ${prof.dz >= 0 ? '+' : ''}${prof.dz.toFixed(2)} m</span>
+        </div>
+        <div class="field">
+          <label>Name &amp; Type</label>
+          <div class="row-between" style="gap:4px;">
+            <input type="text" id="inCircName" value="${escapeHtml(circ.name)}" style="flex:1;" />
+            <div class="segmented" style="display:inline-flex;">
+              <button type="button" class="seg-btn ${!isStair ? 'active' : ''}" data-circkind="ramp">Ramp</button>
+              <button type="button" class="seg-btn ${isStair ? 'active' : ''}" data-circkind="stair">Stair</button>
+            </div>
+          </div>
+        </div>
+        <div class="field-grid">
+          <div class="field"><label>Length L (m)</label><input type="number" id="inCircLen" step="0.2" min="1.2" value="${circ.length.toFixed(2)}" /></div>
+          <div class="field"><label>Width W (m)</label><input type="number" id="inCircWid" step="0.1" min="0.9" value="${circ.width.toFixed(2)}" /></div>
+          <div class="field"><label>Rotation (°)</label><input type="number" id="inCircRot" step="5" min="-180" max="180" value="${Math.round((circ.rot || 0) * 180 / Math.PI)}" /></div>
+          <div class="field"><label>Mid Landings</label><input type="text" disabled value="${prof.numLandings}" /></div>
+        </div>
+        <label class="kw-check-row">
+          <span class="kw-check-left"><input type="checkbox" id="chkCircAutoZ" ${circ.autoTerrainZ ? 'checked' : ''} /><span>Auto Z from Graded Slope &amp; Bubbles</span></span>
+        </label>
+        <div class="field-grid">
+          <div class="field"><label>Start Z (m MSL)</label><input type="number" id="inCircZ0" step="0.1" value="${prof.zStart.toFixed(2)}" ${circ.autoTerrainZ ? 'disabled' : ''} /></div>
+          <div class="field"><label>End Z (m MSL)</label><input type="number" id="inCircZ1" step="0.1" value="${prof.zEnd.toFixed(2)}" ${circ.autoTerrainZ ? 'disabled' : ''} /></div>
+        </div>
+        ${paramHtml}
+        <div class="row-between">
+          <label class="kw-check-row" style="flex:1;"><span class="kw-check-left"><input type="checkbox" id="chkCircRail" ${circ.railing !== false ? 'checked' : ''} /><span>Handrails</span></span></label>
+          <label class="kw-check-row" style="flex:1;"><span class="kw-check-left"><input type="checkbox" id="chkCircWalls" ${circ.sideWalls !== false ? 'checked' : ''} /><span>Side Cheek Walls</span></span></label>
+        </div>
+      </div>
+      <div class="panel-section">
+        <div class="panel-title">Earthwork Impact</div>
+        <div class="earth-box">
+          <div class="earth-stat"><div class="k">Cut Soil</div><div class="v m-cut">${ew.cutVol.toFixed(1)} m³</div></div>
+          <div class="earth-stat"><div class="k">Fill Soil</div><div class="v m-fill">${ew.fillVol.toFixed(1)} m³</div></div>
+        </div>
+        <div class="row-between">
+          <button type="button" class="btn" id="btnCircFlip" style="flex:1">Flip Direction</button>
+          <button type="button" class="btn danger" id="btnCircDel">Delete</button>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('inCircName').addEventListener('change', (e) => updateCirculation(circ.id, { name: e.target.value }, { forceSidebar: true }));
+    body.querySelectorAll('[data-circkind]').forEach(btn => {
+      btn.addEventListener('click', () => updateCirculation(circ.id, { kind: btn.dataset.circkind }, { forceSidebar: true }));
+    });
+    document.getElementById('inCircLen').addEventListener('change', (e) => updateCirculation(circ.id, { length: Math.max(1.2, parseFloat(e.target.value) || circ.length) }, { forceSidebar: true }));
+    document.getElementById('inCircWid').addEventListener('change', (e) => updateCirculation(circ.id, { width: Math.max(0.9, parseFloat(e.target.value) || circ.width) }, { forceSidebar: true }));
+    document.getElementById('inCircRot').addEventListener('change', (e) => updateCirculation(circ.id, { rot: (parseFloat(e.target.value) || 0) * Math.PI / 180 }, { forceSidebar: true }));
+    document.getElementById('chkCircAutoZ').addEventListener('change', (e) => {
+      updateCirculation(circ.id, { autoTerrainZ: e.target.checked, zStart: prof.zStart, zEnd: prof.zEnd }, { forceSidebar: true });
+    });
+    document.getElementById('inCircZ0').addEventListener('change', (e) => updateCirculation(circ.id, { zStart: parseFloat(e.target.value) || prof.zStart }, { forceSidebar: true }));
+    document.getElementById('inCircZ1').addEventListener('change', (e) => updateCirculation(circ.id, { zEnd: parseFloat(e.target.value) || prof.zEnd }, { forceSidebar: true }));
+
+    if (isStair) {
+      document.getElementById('inCircRiser').addEventListener('change', (e) => updateCirculation(circ.id, { riserHeight: parseFloat(e.target.value) || 0.165 }, { forceSidebar: true }));
+      document.getElementById('inCircTread').addEventListener('change', (e) => updateCirculation(circ.id, { treadDepth: parseFloat(e.target.value) || 0.30 }, { forceSidebar: true }));
+      document.getElementById('inCircLandInt').addEventListener('change', (e) => updateCirculation(circ.id, { landingInterval: parseInt(e.target.value, 10) || 0 }, { forceSidebar: true }));
+    } else {
+      document.getElementById('inCircTargetSlope').addEventListener('change', (e) => updateCirculation(circ.id, { targetSlopePct: parseFloat(e.target.value) || 8 }, { forceSidebar: true }));
+      document.getElementById('inCircMaxRun').addEventListener('change', (e) => updateCirculation(circ.id, { maxRunBeforeLanding: parseFloat(e.target.value) || 0 }, { forceSidebar: true }));
+      document.getElementById('inCircSlabT').addEventListener('change', (e) => updateCirculation(circ.id, { slabThickness: parseFloat(e.target.value) || 0.25 }, { forceSidebar: true }));
+    }
+    document.getElementById('inCircLandLen').addEventListener('change', (e) => updateCirculation(circ.id, { landingLength: parseFloat(e.target.value) || 1.4 }, { forceSidebar: true }));
+    document.getElementById('btnCircFitLen').addEventListener('click', () => {
+      updateCirculation(circ.id, { length: Math.max(1.5, prof.recommendedLength) }, { forceSidebar: true });
+    });
+    document.getElementById('chkCircRail').addEventListener('change', (e) => updateCirculation(circ.id, { railing: e.target.checked }, { forceSidebar: true }));
+    document.getElementById('chkCircWalls').addEventListener('change', (e) => updateCirculation(circ.id, { sideWalls: e.target.checked }, { forceSidebar: true }));
+    document.getElementById('btnCircFlip').addEventListener('click', () => {
+      updateCirculation(circ.id, { rot: (circ.rot || 0) + Math.PI, zStart: prof.zEnd, zEnd: prof.zStart }, { forceSidebar: true });
+    });
+    document.getElementById('btnCircDel').addEventListener('click', () => deleteCirculation(circ.id));
+  }
+
+  function renderTabRainwater(body) {
+    const rain = getRainwaterAnalysis();
+    const cfg = state.rainConfig || { intensityMmHr: 50, durationHr: 1.0, annualMm: 1600 };
+
+    const p1 = document.createElement('div');
+    p1.className = 'panel-section';
+    p1.innerHTML = `
+      <div class="panel-title">
+        <span>Rainwater Flow &amp; Harvesting</span>
+        <button type="button" class="btn ${state.layers.rainwater ? 'active' : ''}" id="btnRainLayerSide" style="padding:2px 8px;">${state.layers.rainwater ? 'Overlay ON' : 'Show Flow'}</button>
+      </div>
+      <div class="field-grid">
+        <div class="field"><label>Storm (mm/hr)</label><input type="number" id="inRainInt" step="5" min="5" max="250" value="${cfg.intensityMmHr}" /></div>
+        <div class="field"><label>Duration (hr)</label><input type="number" id="inRainDur" step="0.25" min="0.25" max="24" value="${cfg.durationHr}" /></div>
+        <div class="field" style="grid-column:span 2;"><label>Annual Kotagiri Rainfall (mm/yr)</label><input type="number" id="inRainAnnual" step="50" min="100" max="6000" value="${cfg.annualMm}" /></div>
+      </div>
+      <div class="earth-box">
+        <div class="earth-stat"><div class="k">Roof Storm Harvest</div><div class="v">${rain.roofStormM3} m³</div></div>
+        <div class="earth-stat"><div class="k">Cistern Suggested</div><div class="v">${rain.suggestedCisternM3} m³</div></div>
+        <div class="earth-stat"><div class="k">Peak Runoff</div><div class="v">${rain.peakRunoffLs} L/s</div></div>
+        <div class="earth-stat"><div class="k">Annual Roof Yield</div><div class="v">${rain.roofAnnualM3} m³/yr</div></div>
+      </div>
+    `;
+    body.appendChild(p1);
+
+    const p2 = document.createElement('div');
+    p2.className = 'panel-section';
+    p2.innerHTML = `<div class="panel-title">Detected Collection &amp; Outlets (${rain.collections.length})</div>` +
+      (rain.collections.length === 0
+        ? `<div class="note-box">No major flow convergence cells detected at this grid threshold.</div>`
+        : rain.collections.map(c => `
+            <div class="rain-basin-row">
+              <div><strong>${c.id}</strong> · ${escapeHtml(c.kind)} <span style="color:var(--ink-muted);">(${c.z.toFixed(1)}m)</span></div>
+              <div style="font-family:var(--mono);font-size:10.5px;">${c.catchmentM2} m² · ${c.peakLs} L/s · ${c.stormM3} m³</div>
+            </div>
+          `).join(''));
+    body.appendChild(p2);
+
+    const p3 = document.createElement('div');
+    p3.className = 'panel-section';
+    p3.innerHTML = `<div class="panel-title">Flood &amp; Runoff Channel Flags (${rain.riskVolumes.length})</div>` +
+      (rain.riskVolumes.length === 0
+        ? `<div class="note-box">No placed buildings currently sit directly inside a high-accumulation gully (&ge; 140 m²) or local ponding pocket.</div>`
+        : rain.riskVolumes.map(r => `
+            <div class="rain-basin-row">
+              <div><strong>${escapeHtml(r.ref)} ${escapeHtml(r.short)}</strong></div>
+              <div style="font-family:var(--mono);font-size:10px;color:var(--cut-color);">${escapeHtml(r.reason)} (${r.accAreaM2}m²)</div>
+            </div>
+          `).join(''));
+    body.appendChild(p3);
+
+    document.getElementById('btnRainLayerSide').addEventListener('click', () => {
+      state.layers.rainwater = !state.layers.rainwater;
+      refreshAll();
+    });
+    const updateRainCfg = (patch) => {
+      state.rainConfig = { ...cfg, ...patch };
+      refreshAll();
+    };
+    document.getElementById('inRainInt').addEventListener('change', (e) => updateRainCfg({ intensityMmHr: parseFloat(e.target.value) || 50 }));
+    document.getElementById('inRainDur').addEventListener('change', (e) => updateRainCfg({ durationHr: parseFloat(e.target.value) || 1 }));
+    document.getElementById('inRainAnnual').addEventListener('change', (e) => updateRainCfg({ annualMm: parseFloat(e.target.value) || 1600 }));
+  }
+
   function renderSelectedSectionPlane(body, plane) {
     body.innerHTML = `
       <div class="panel-section">
@@ -1359,6 +1825,14 @@
       } else if (state.selectedItem.kind === 'section') {
         const plane = state.planes.find(p => p.id === state.selectedItem.id) || getActivePlane();
         if (plane) { renderSelectedSectionPlane(body, plane); return; }
+        state.selectedItem = null;
+      } else if (state.selectedItem.kind === 'terrain') {
+        const mod = (state.terrainMods || []).find(m => m.id === state.selectedItem.id);
+        if (mod) { renderSelectedTerrainMod(body, mod); return; }
+        state.selectedItem = null;
+      } else if (state.selectedItem.kind === 'circulation') {
+        const circ = (state.circulations || []).find(c => c.id === state.selectedItem.id);
+        if (circ) { renderSelectedCirculation(body, circ); return; }
         state.selectedItem = null;
       }
     }
@@ -1993,6 +2467,7 @@
       ['trees', 'Site Vegetation (Trees)'],
       ['cutFill', 'Cut & Fill Soil Volumes'],
       ['snap', 'Magnetic Snap & Smart Guides (S)'],
+      ['rainwater', 'Rainwater Flow & Collection (W)'],
       ['rectDims', 'Rectangle Dimensions (Zoomed)'],
       ['annotations', 'Annotations (Text & Lines)'],
       ['translucentTerrain', 'Translucent Terrain (3D)']
@@ -2109,6 +2584,8 @@
           state.volumes = JSON.parse(JSON.stringify(it.volumes || [])).map(normalizeVolume);
           state.planes = JSON.parse(JSON.stringify(it.planes || [createDefaultPlane()]));
           state.annotations = JSON.parse(JSON.stringify(it.annotations || []));
+          state.terrainMods = JSON.parse(JSON.stringify(it.terrainMods || [])).map(m => siteTools.normalizeTerrainMod(m));
+          state.circulations = JSON.parse(JSON.stringify(it.circulations || [])).map(c => siteTools.normalizeCirculation(c));
           if (Array.isArray(it.customSpaces)) {
             state.customSpaces = JSON.parse(JSON.stringify(it.customSpaces)).map(normalizeVolume);
           }
@@ -2151,6 +2628,8 @@
       volumes: JSON.parse(JSON.stringify(state.volumes)),
       planes: JSON.parse(JSON.stringify(state.planes)),
       annotations: JSON.parse(JSON.stringify(state.annotations)),
+      terrainMods: JSON.parse(JSON.stringify(state.terrainMods || [])),
+      circulations: JSON.parse(JSON.stringify(state.circulations || [])),
       customSpaces: JSON.parse(JSON.stringify(state.customSpaces)),
       activePlaneId: state.activePlaneId
     });
@@ -2298,7 +2777,27 @@
     toast(state.layers.snap ? 'Magnetic Snap & Align ON' : 'Magnetic Snap & Align OFF');
   }
   document.getElementById('btnToggleSnap').addEventListener('click', toggleSnapLayer);
+  document.getElementById('btn3dSnapToggle').addEventListener('click', toggleSnapLayer);
   document.getElementById('btnSecSnapToggle').addEventListener('click', toggleSnapLayer);
+
+  function toggleRainwaterLayer() {
+    state.layers.rainwater = !state.layers.rainwater;
+    refreshAll();
+    toast(state.layers.rainwater ? 'Rainwater Flow Analysis ON' : 'Rainwater Flow Analysis OFF');
+  }
+  document.getElementById('btnPlanRainToggle').addEventListener('click', toggleRainwaterLayer);
+  document.getElementById('btn3dBoxSelect').addEventListener('click', () => {
+    if (view3D.setBoxSelectMode) view3D.setBoxSelectMode(!view3D.boxSelectMode);
+    updateTopBarMetrics();
+    toast(view3D.boxSelectMode ? '3D Box Select ON (L→R Window / R→L Crossing)' : '3D Orbit Mode ON');
+  });
+  document.querySelectorAll('#terrainShapeSwitch .seg-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.terrainDrawShape = btn.dataset.shape === 'poly' ? 'poly' : 'rect';
+      planView.polyDraft = [];
+      refreshAll();
+    });
+  });
 
   document.getElementById('btnToggleRectDims').addEventListener('click', () => {
     state.layers.rectDims = !state.layers.rectDims;
@@ -2470,12 +2969,16 @@
     state.tool = toolName;
     planView.dimDraft = null;
     planView.lineDraft = null;
+    planView.polyDraft = [];
     view3D.dimDraft = null;
     sectionView.dimDraft = null;
     sectionView.lineDraft = null;
     refreshAll();
     const names = {
       select: 'Select tool (V)',
+      terrain: 'Terrain Pad / Retaining Wall tool (P)',
+      ramp: 'Parametric Ramp tool (K)',
+      stair: 'Parametric Stair tool (J)',
       dimension: 'Dimension tool (D)',
       line: 'Line / Arrow tool (L)',
       text: 'Text Annotation tool (A)',
@@ -2527,10 +3030,19 @@
     if (hasMod) return;
 
     if (k === 'v') { setTool('select'); }
+    else if (k === 'p') { setTool('terrain'); }
+    else if (k === 'k') { setTool('ramp'); }
+    else if (k === 'j') { setTool('stair'); }
     else if (k === 'd') { setTool('dimension'); }
     else if (k === 'l') { setTool('line'); }
     else if (k === 'a') { setTool('text'); }
     else if (k === 's') { toggleSnapLayer(); }
+    else if (k === 'w') { toggleRainwaterLayer(); }
+    else if (k === 'u') {
+      if (view3D.setBoxSelectMode) view3D.setBoxSelectMode(!view3D.boxSelectMode);
+      updateTopBarMetrics();
+      toast(view3D.boxSelectMode ? '3D Box Select ON' : '3D Orbit Mode ON');
+    }
     else if (k === 'r') {
       state.layers.rectDims = !state.layers.rectDims;
       refreshAll();
@@ -2605,6 +3117,8 @@
         e.preventDefault();
         if (state.selectedItem.kind === 'dim') deleteDimension(state.selectedItem.id);
         else if (state.selectedItem.kind === 'line' || state.selectedItem.kind === 'text') deleteAnnotation(state.selectedItem.id);
+        else if (state.selectedItem.kind === 'terrain') deleteTerrainMod(state.selectedItem.id);
+        else if (state.selectedItem.kind === 'circulation') deleteCirculation(state.selectedItem.id);
         else if (state.selectedItem.kind === 'section') clearSelection();
       }
     } else if (e.key === 'Escape') {
@@ -2632,6 +3146,14 @@
     alignSelectedVolumes,
     snapVolumeToNearest,
     matchNearestAngle,
+    addTerrainMod,
+    updateTerrainMod,
+    deleteTerrainMod,
+    addCirculation,
+    updateCirculation,
+    deleteCirculation,
+    getRainwaterAnalysis,
+    setTool,
     planView,
     view3D,
     sectionView,
