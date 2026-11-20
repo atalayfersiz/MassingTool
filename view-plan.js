@@ -24,6 +24,7 @@
       this.marquee = null;
       this.spaceHeld = false;
       this.cursorWorld = null;
+      this.snapGuides = [];
 
       this._bindEvents();
     }
@@ -336,6 +337,7 @@
                 x: v.x,
                 y: v.y,
                 zBase: v.zBase,
+                rot: v.rot || 0,
                 gz: window.GROUNDWORK_ENGINE.getGroundZ(v.x, v.y)
               };
             }
@@ -470,16 +472,31 @@
         }
 
         if (this.dragState.type === 'move') {
-          const dx = world.x - this.dragState.startWorld.x;
-          const dy = world.y - this.dragState.startWorld.y;
+          let dx = world.x - this.dragState.startWorld.x;
+          let dy = world.y - this.dragState.startWorld.y;
           if (Math.hypot(dx, dy) > 0.02) this.dragState.moved = true;
+          let snapRot = null;
+          if (state.layers.snap !== false && !e.altKey) {
+            const snap = this._computeMoveSnap(dx, dy, state);
+            dx = snap.dx;
+            dy = snap.dy;
+            snapRot = snap.snapRot;
+            this.snapGuides = snap.guides || [];
+          } else {
+            this.snapGuides = [];
+          }
+          const origCount = Object.keys(this.dragState.origins).length;
           const updates = [];
           for (const [id, orig] of Object.entries(this.dragState.origins)) {
             const nx = orig.x + dx;
             const ny = orig.y + dy;
             const newGZ = window.GROUNDWORK_ENGINE.getGroundZ(nx, ny);
             const zOffset = orig.zBase - orig.gz;
-            updates.push({ id, x: nx, y: ny, zBase: newGZ + zOffset });
+            const patch = { id, x: nx, y: ny, zBase: newGZ + zOffset };
+            if (snapRot !== null && origCount === 1 && id === this.dragState.primaryId) {
+              patch.rot = snapRot;
+            }
+            updates.push(patch);
           }
           this.api.updateVolumesBatch(updates, { silentUndo: true });
           return;
@@ -492,6 +509,13 @@
           if (e.shiftKey) {
             const step = Math.PI / 12; // 15 deg snap
             ang = Math.round(ang / step) * step;
+            this.snapGuides = [];
+          } else if (state.layers.snap !== false && !e.altKey) {
+            const rs = this._computeRotateSnap(vol, ang, state);
+            ang = rs.ang;
+            this.snapGuides = rs.guides || [];
+          } else {
+            this.snapGuides = [];
           }
           this.api.updateVolume(vol.id, { rot: ang }, { silentUndo: true });
           return;
@@ -503,8 +527,17 @@
           const dy = world.y - orig.y;
           const c = Math.cos(orig.rot || 0);
           const s = Math.sin(orig.rot || 0);
-          const lx = dx * c + dy * s;
-          const ly = -dx * s + dy * c;
+          let lx = dx * c + dy * s;
+          let ly = -dx * s + dy * c;
+
+          if (state.layers.snap !== false && !e.altKey) {
+            const rzs = this._computeResizeSnap(orig, this.dragState.handle, lx, ly, state);
+            lx = rzs.lx;
+            ly = rzs.ly;
+            this.snapGuides = rzs.guides || [];
+          } else {
+            this.snapGuides = [];
+          }
 
           const dims = window.GROUNDWORK_ENGINE.getEffectiveDims(orig, state.useGross);
           const lin = Math.sqrt(dims.grossFactor);
@@ -612,6 +645,7 @@
         }
         try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) {}
         this.dragState = null;
+        this.snapGuides = [];
         this.render();
       });
 
@@ -1183,6 +1217,11 @@
         ctx.textBaseline = 'middle';
         ctx.fillText(text, mx, my + 0.5);
         ctx.restore();
+      }
+
+      // Magnetic Snap & Alignment Smart Guides
+      if (this.snapGuides && this.snapGuides.length > 0) {
+        this._drawSnapGuides(ctx, pal, state.theme === 'dark');
       }
 
       // Selection handles
@@ -2004,6 +2043,334 @@
 
       parts.push('</svg>');
       return parts.join('\n');
+    }
+
+    _computeMoveSnap(dx, dy, state) {
+      const eng = window.GROUNDWORK_ENGINE;
+      const dragIds = new Set(Object.keys(this.dragState.origins));
+      const primaryId = this.dragState.primaryId;
+      const orig = this.dragState.origins[primaryId];
+      const primaryVol = this.api.getVolume(primaryId);
+      if (!orig || !primaryVol) return { dx, dy, snapRot: null, guides: [] };
+
+      const rawX = orig.x + dx;
+      const rawY = orig.y + dy;
+      const snapTol = Math.max(0.45, Math.min(2.2, 11 / Math.max(0.5, this.cam.pxPerM)));
+      const dimsA = eng.getEffectiveDims(primaryVol, state.useGross);
+      const isSingle = dragIds.size === 1;
+
+      let bestU = null;
+      let bestV = null;
+
+      for (const B of state.volumes) {
+        if (dragIds.has(B.id)) continue;
+        const rotB = B.rot || 0;
+        const cB = Math.cos(rotB);
+        const sB = Math.sin(rotB);
+        const rx = (rawX - B.x) * cB + (rawY - B.y) * sB;
+        const ry = -(rawX - B.x) * sB + (rawY - B.y) * cB;
+
+        const dimsB = eng.getEffectiveDims(B, state.useGross);
+        const hBx = dimsB.w * 0.5;
+        const hBy = dimsB.d * 0.5;
+
+        let dA = (orig.rot || 0) - rotB;
+        dA = Math.atan2(Math.sin(dA), Math.cos(dA));
+        const qStep = Math.round(dA / (Math.PI * 0.5)) * (Math.PI * 0.5);
+        const canAutoAngle = isSingle && Math.abs(dA - qStep) <= 0.28;
+        const candRot = canAutoAngle ? (rotB + qStep) : (orig.rot || 0);
+        const relRot = candRot - rotB;
+        const ca = Math.abs(Math.cos(relRot));
+        const sa = Math.abs(Math.sin(relRot));
+        const hAx = (dimsA.w * ca + dimsA.d * sa) * 0.5;
+        const hAy = (dimsA.w * sa + dimsA.d * ca) * 0.5;
+
+        if (Math.abs(rx) > hAx + hBx + 28 || Math.abs(ry) > hAy + hBy + 28) continue;
+
+        const nearY = Math.abs(ry) <= hAy + hBy + snapTol;
+        const nearX = Math.abs(rx) <= hAx + hBx + snapTol;
+
+        const uCands = [
+          { val: 0, edgeLocal: 0, kind: 'Center' },
+          { val: -hBx + hAx, edgeLocal: -hBx, kind: 'Flush' },
+          { val: hBx - hAx, edgeLocal: hBx, kind: 'Flush' }
+        ];
+        if (nearY) {
+          uCands.push(
+            { val: -(hBx + hAx), edgeLocal: -hBx, kind: 'Abut' },
+            { val: hBx + hAx, edgeLocal: hBx, kind: 'Abut' }
+          );
+        }
+        for (const uc of uCands) {
+          const err = Math.abs(rx - uc.val);
+          if (err < snapTol && (!bestU || err < bestU.err)) {
+            bestU = {
+              err,
+              B,
+              rotB,
+              cB,
+              sB,
+              targetRx: uc.val,
+              edgeLocal: uc.edgeLocal,
+              ry,
+              hAx,
+              hAy,
+              hBx,
+              hBy,
+              candRot,
+              angleMatched: canAutoAngle && Math.abs(dA - qStep) > 0.015,
+              kind: uc.kind
+            };
+          }
+        }
+
+        const vCands = [
+          { val: 0, edgeLocal: 0, kind: 'Center' },
+          { val: -hBy + hAy, edgeLocal: -hBy, kind: 'Flush' },
+          { val: hBy - hAy, edgeLocal: hBy, kind: 'Flush' }
+        ];
+        if (nearX) {
+          vCands.push(
+            { val: -(hBy + hAy), edgeLocal: -hBy, kind: 'Abut' },
+            { val: hBy + hAy, edgeLocal: hBy, kind: 'Abut' }
+          );
+        }
+        for (const vc of vCands) {
+          const err = Math.abs(ry - vc.val);
+          if (err < snapTol && (!bestV || err < bestV.err)) {
+            bestV = {
+              err,
+              B,
+              rotB,
+              cB,
+              sB,
+              targetRy: vc.val,
+              edgeLocal: vc.edgeLocal,
+              rx,
+              hAx,
+              hAy,
+              hBx,
+              hBy,
+              candRot,
+              angleMatched: canAutoAngle && Math.abs(dA - qStep) > 0.015,
+              kind: vc.kind
+            };
+          }
+        }
+      }
+
+      let snapX = rawX;
+      let snapY = rawY;
+      let snapRot = null;
+      const guides = [];
+
+      if (bestU && bestV) {
+        // Intersect constraint 1: n1 . (p - B1) = targetRx  where n1 = (c1, s1)
+        // with constraint 2:      n2 . (p - B2) = targetRy  where n2 = (-s2, c2)
+        const n1x = bestU.cB, n1y = bestU.sB;
+        const rhs1 = bestU.B.x * n1x + bestU.B.y * n1y + bestU.targetRx;
+        const n2x = -bestV.sB, n2y = bestV.cB;
+        const rhs2 = bestV.B.x * n2x + bestV.B.y * n2y + bestV.targetRy;
+        const det = n1x * n2y - n1y * n2x;
+        if (Math.abs(det) > 0.05) {
+          snapX = (rhs1 * n2y - n1y * rhs2) / det;
+          snapY = (n1x * rhs2 - rhs1 * n2x) / det;
+        } else {
+          snapX = rawX + (bestU.targetRx - ((rawX - bestU.B.x) * bestU.cB + (rawY - bestU.B.y) * bestU.sB)) * bestU.cB;
+          snapY = rawY + (bestU.targetRx - ((rawX - bestU.B.x) * bestU.cB + (rawY - bestU.B.y) * bestU.sB)) * bestU.sB;
+        }
+      } else if (bestU) {
+        const curRx = (rawX - bestU.B.x) * bestU.cB + (rawY - bestU.B.y) * bestU.sB;
+        const shift = bestU.targetRx - curRx;
+        snapX = rawX + shift * bestU.cB;
+        snapY = rawY + shift * bestU.sB;
+      } else if (bestV) {
+        const curRy = -(rawX - bestV.B.x) * bestV.sB + (rawY - bestV.B.y) * bestV.cB;
+        const shift = bestV.targetRy - curRy;
+        snapX = rawX + shift * (-bestV.sB);
+        snapY = rawY + shift * bestV.cB;
+      }
+
+      const rotSrc = (bestU && (!bestV || bestU.err <= bestV.err)) ? bestU : bestV;
+      if (isSingle && rotSrc && (rotSrc.kind === 'Abut' || rotSrc.kind === 'Flush' || rotSrc.kind === 'Center')) {
+        if (Math.abs((orig.rot || 0) - rotSrc.candRot) > 0.002) {
+          snapRot = rotSrc.candRot;
+        }
+      }
+
+      if (bestU) {
+        const finRy = -(snapX - bestU.B.x) * bestU.sB + (snapY - bestU.B.y) * bestU.cB;
+        const vMin = Math.min(-bestU.hBy, finRy - bestU.hAy) - 2.2;
+        const vMax = Math.max(bestU.hBy, finRy + bestU.hAy) + 2.2;
+        const toW = (u, v) => ({
+          x: bestU.B.x + u * bestU.cB - v * bestU.sB,
+          y: bestU.B.y + u * bestU.sB + v * bestU.cB
+        });
+        const label = bestU.kind + (snapRot !== null && bestU === rotSrc ? ' · ∠ Match' : '');
+        guides.push({ kind: 'line', p1: toW(bestU.edgeLocal, vMin), p2: toW(bestU.edgeLocal, vMax), label });
+      }
+      if (bestV) {
+        const finRx = (snapX - bestV.B.x) * bestV.cB + (snapY - bestV.B.y) * bestV.sB;
+        const uMin = Math.min(-bestV.hBx, finRx - bestV.hAx) - 2.2;
+        const uMax = Math.max(bestV.hBx, finRx + bestV.hAx) + 2.2;
+        const toW = (u, v) => ({
+          x: bestV.B.x + u * bestV.cB - v * bestV.sB,
+          y: bestV.B.y + u * bestV.sB + v * bestV.cB
+        });
+        const label = bestV.kind + (snapRot !== null && bestV === rotSrc ? ' · ∠ Match' : '');
+        guides.push({ kind: 'line', p1: toW(uMin, bestV.edgeLocal), p2: toW(uMax, bestV.edgeLocal), label });
+      }
+
+      return { dx: snapX - orig.x, dy: snapY - orig.y, snapRot, guides };
+    }
+
+    _computeRotateSnap(vol, rawAng, state) {
+      const tol = 0.07; // ~4 deg
+      const cands = [];
+      for (let k = -2; k <= 2; k++) {
+        cands.push({ ang: k * Math.PI * 0.5, label: '0° / 90°' });
+      }
+      const plane = this.api.getActivePlane();
+      if (plane) {
+        const pRad = (plane.angleDeg || 0) * Math.PI / 180;
+        for (let k = -2; k <= 2; k++) {
+          cands.push({ ang: pRad + k * Math.PI * 0.5, label: `∠ ${plane.name}-${plane.name}'` });
+        }
+      }
+      for (const B of state.volumes) {
+        if (B.id === vol.id) continue;
+        const bRot = B.rot || 0;
+        for (let k = -2; k <= 2; k++) {
+          cands.push({ ang: bRot + k * Math.PI * 0.5, label: `∠ ${B.ref || B.id}` });
+        }
+      }
+
+      let best = null;
+      for (const cd of cands) {
+        const diff = Math.atan2(Math.sin(cd.ang - rawAng), Math.cos(cd.ang - rawAng));
+        const err = Math.abs(diff);
+        if (err < tol && (!best || err < best.err)) {
+          best = { ang: rawAng + diff, err, label: cd.label };
+        }
+      }
+      if (!best) return { ang: rawAng, guides: [] };
+      const rLen = Math.max(vol.w, vol.d) * 0.8 + 4;
+      const ca = Math.cos(best.ang), sa = Math.sin(best.ang);
+      return {
+        ang: best.ang,
+        guides: [{
+          kind: 'line',
+          p1: { x: vol.x - ca * rLen, y: vol.y - sa * rLen },
+          p2: { x: vol.x + ca * rLen, y: vol.y + sa * rLen },
+          label: best.label
+        }]
+      };
+    }
+
+    _computeResizeSnap(orig, handle, lx, ly, state) {
+      const eng = window.GROUNDWORK_ENGINE;
+      const snapTol = Math.max(0.35, Math.min(1.6, 10 / Math.max(0.5, this.cam.pxPerM)));
+      const rot = orig.rot || 0;
+      const c = Math.cos(rot), s = Math.sin(rot);
+      const wantU = handle.includes('e') || handle.includes('w');
+      const wantV = handle.includes('n') || handle.includes('s');
+
+      let bestU = null;
+      let bestV = null;
+
+      for (const B of state.volumes) {
+        if (B.id === orig.id) continue;
+        if (Math.abs(Math.sin((B.rot || 0) - rot)) > 0.08) continue;
+        const corners = eng.getFootprintCorners(B, state.useGross);
+        let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+        for (const [cx, cy] of corners) {
+          const u = (cx - orig.x) * c + (cy - orig.y) * s;
+          const v = -(cx - orig.x) * s + (cy - orig.y) * c;
+          if (u < minU) minU = u;
+          if (u > maxU) maxU = u;
+          if (v < minV) minV = v;
+          if (v > maxV) maxV = v;
+        }
+        if (Math.abs((minU + maxU) * 0.5) > 36 && Math.abs((minV + maxV) * 0.5) > 36) continue;
+
+        if (wantU) {
+          for (const targetU of [minU, maxU]) {
+            if ((lx >= 0 && targetU <= 0.3) || (lx < 0 && targetU >= -0.3)) continue;
+            const err = Math.abs(lx - targetU);
+            if (err < snapTol && (!bestU || err < bestU.err)) {
+              bestU = { err, targetU, minV: Math.min(minV, -orig.d * 0.5), maxV: Math.max(maxV, orig.d * 0.5) };
+            }
+          }
+        }
+        if (wantV) {
+          for (const targetV of [minV, maxV]) {
+            if ((ly >= 0 && targetV <= 0.3) || (ly < 0 && targetV >= -0.3)) continue;
+            const err = Math.abs(ly - targetV);
+            if (err < snapTol && (!bestV || err < bestV.err)) {
+              bestV = { err, targetV, minU: Math.min(minU, -orig.w * 0.5), maxU: Math.max(maxU, orig.w * 0.5) };
+            }
+          }
+        }
+      }
+
+      const toW = (u, v) => ({
+        x: orig.x + u * c - v * s,
+        y: orig.y + u * s + v * c
+      });
+      const guides = [];
+      let outLx = lx;
+      let outLy = ly;
+      if (bestU) {
+        outLx = bestU.targetU;
+        guides.push({ kind: 'line', p1: toW(outLx, bestU.minV - 2), p2: toW(outLx, bestU.maxV + 2), label: 'Align Edge' });
+      }
+      if (bestV) {
+        outLy = bestV.targetV;
+        guides.push({ kind: 'line', p1: toW(bestV.minU - 2, outLy), p2: toW(bestV.maxU + 2, outLy), label: 'Align Edge' });
+      }
+      return { lx: outLx, ly: outLy, guides };
+    }
+
+    _drawSnapGuides(ctx, pal, isDark) {
+      const col = isDark ? '#e07b5f' : '#b85d43';
+      ctx.save();
+      for (const g of this.snapGuides) {
+        if (!g.p1 || !g.p2) continue;
+        const a = this.worldToScreen(g.p1.x, g.p1.y);
+        const b = this.worldToScreen(g.p2.x, g.p2.y);
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        for (const pt of [a, b]) {
+          ctx.fillStyle = col;
+          ctx.beginPath();
+          ctx.arc(pt.x, pt.y, 2.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        if (g.label) {
+          const mx = (a.x + b.x) * 0.5;
+          const my = (a.y + b.y) * 0.5;
+          ctx.font = '600 9.5px ui-monospace, monospace';
+          const tw = ctx.measureText(g.label).width + 10;
+          ctx.fillStyle = pal.badgeBg;
+          ctx.strokeStyle = col;
+          ctx.lineWidth = 1;
+          ctx.fillRect(mx - tw * 0.5, my - 8, tw, 15);
+          ctx.strokeRect(mx - tw * 0.5, my - 8, tw, 15);
+          ctx.fillStyle = col;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(g.label, mx, my);
+        }
+      }
+      ctx.restore();
     }
 
     _esc(str) {

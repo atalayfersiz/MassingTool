@@ -337,6 +337,23 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; colo
 .row-between { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .row-wrap { display: flex; flex-wrap: wrap; gap: 4px; }
 
+.align-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+}
+.align-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px;
+}
+.align-btn {
+  padding: 4px 6px;
+  font-size: 10.5px;
+  text-align: center;
+  white-space: nowrap;
+}
+
 .kw-pill {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 2px 6px; border-radius: 3px; font-size: 10.5px;

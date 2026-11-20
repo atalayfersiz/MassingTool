@@ -93,6 +93,7 @@
               <span style="color:var(--ink-muted);font-weight:400;">Stretch edges (area-locked) · Rotate · Drag near to merge keywords</span>
             </div>
             <div class="vp-controls">
+              <button class="vp-btn active" id="btnToggleSnap" title="Toggle Magnetic Snap &amp; Alignment Guides (S · Hold Alt to bypass)">Snap</button>
               <button class="vp-btn active" id="btnToggleRectDims" title="Show rectangle dimensions when zoomed in (R)">Rect Dims</button>
               <button class="vp-btn active" id="btnPlanAnnToggle" title="Toggle Text &amp; Line annotations">Annotations</button>
               <button class="vp-btn" id="btnShowDock" style="display:none;" title="Show Program Bar (B)">Program Bar</button>
@@ -112,7 +113,7 @@
           <div class="vp-hud">
             <div class="vp-tag">
               <span>3D Site &amp; Earthwork</span>
-              <span style="color:var(--ink-muted);font-weight:400;">Click space for XYZ gizmo</span>
+              <span id="vp3dOrbitHint" style="color:var(--ink-muted);font-weight:400;">Click space to orbit around it &amp; edit XYZ</span>
             </div>
             <div class="vp-controls">
               <button class="vp-btn" id="btn3dTranslucent" title="Toggle Translucent Ground (T)">Translucent Ground</button>
@@ -132,6 +133,7 @@
             </div>
             <div class="vp-controls">
               <div id="secQuickTabs" style="display:inline-flex;gap:2px;"></div>
+              <button class="vp-btn active" id="btnSecSnapToggle" title="Toggle Magnetic Snap &amp; Alignment Guides (S · Hold Alt to bypass)">Snap</button>
               <button class="vp-btn active" id="btnSecAnnToggle" title="Toggle Text &amp; Line annotations">Annotations</button>
               <button class="vp-btn" id="btnSecFlip" title="Flip Section Direction (X)">Flip</button>
               <button class="vp-btn" id="btnSecFit" title="Fit Section (F)">Fit Section</button>
@@ -231,6 +233,7 @@
               <div class="shortcut-row"><span>Section Plane tool</span><span class="kbd">C</span></div>
               <div class="shortcut-row"><span>Toggle 3D Clipping</span><span class="kbd">Shift + C</span></div>
               <div class="shortcut-row"><span>Flip Section direction</span><span class="kbd">X</span></div>
+              <div class="shortcut-row"><span>Magnetic Snap &amp; Align</span><span class="kbd">S (Alt bypass)</span></div>
               <div class="shortcut-row"><span>Toggle rectangle dims</span><span class="kbd">R</span></div>
               <div class="shortcut-row"><span>Split / Plan / 3D / Section</span><span class="kbd">1 – 4</span></div>
               <div class="shortcut-row"><span>Fit Site across views</span><span class="kbd">F</span></div>

@@ -53,6 +53,9 @@
       this.transformOrig = null;
       this.dimDraft = null;
       this.pointerDownPos = null;
+      this._pendingOrbitFocus = false;
+      this._lastOrbitSelKey = '';
+      this._lastPivotPos = null;
 
       this.volumeGroups = new Map();
       this.earthworkGroup = new THREE.Group();
@@ -329,11 +332,70 @@
       }
     }
 
+    _getSelectionPivot3D(state) {
+      if (!state || !state.selectedIds || state.selectedIds.length === 0) return null;
+      const eng = window.GROUNDWORK_ENGINE;
+      let minX = Infinity, maxX = -Infinity;
+      let minY = Infinity, maxY = -Infinity;
+      let minZ = Infinity, maxZ = -Infinity;
+      let count = 0;
+      let primaryVol = null;
+
+      for (const id of state.selectedIds) {
+        const vol = this.api.getVolume(id);
+        if (!vol) continue;
+        if (!primaryVol) primaryVol = vol;
+        count++;
+        const dims = eng.getEffectiveDims(vol, state.useGross);
+        const roof = eng.getRoofSpec(vol);
+        const apexRise = eng.getRoofApexRise(dims, roof);
+        const totalH = dims.totalHeight + apexRise;
+        const cx = vol.x;
+        const cy = vol.zBase + totalH * 0.5 - this.zDatum;
+        const cz = -vol.y;
+        const c = Math.abs(Math.cos(vol.rot || 0));
+        const s = Math.abs(Math.sin(vol.rot || 0));
+        const hw = dims.w * 0.5 * c + dims.d * 0.5 * s;
+        const hh = totalH * 0.5;
+        const hd = dims.w * 0.5 * s + dims.d * 0.5 * c;
+        if (cx - hw < minX) minX = cx - hw;
+        if (cx + hw > maxX) maxX = cx + hw;
+        if (cy - hh < minY) minY = cy - hh;
+        if (cy + hh > maxY) maxY = cy + hh;
+        if (cz - hd < minZ) minZ = cz - hd;
+        if (cz + hd > maxZ) maxZ = cz + hd;
+      }
+      if (count === 0) return null;
+      return {
+        pivot: new THREE.Vector3((minX + maxX) * 0.5, (minY + maxY) * 0.5, (minZ + maxZ) * 0.5),
+        radius: Math.max(4, Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) * 0.5),
+        count,
+        primaryVol
+      };
+    }
+
+    focusSelection(opts = {}) {
+      const info = this._getSelectionPivot3D(this.api.getState());
+      if (!info) return false;
+      const offset = new THREE.Vector3().subVectors(this.camera.position, this.orbit.target);
+      if (offset.lengthSq() < 1e-4) offset.set(36, 28, 42);
+      if (opts.fitDistance) {
+        offset.setLength(Math.max(22, info.radius * 3.0));
+      }
+      this.orbit.target.copy(info.pivot);
+      this.camera.position.copy(info.pivot).add(offset);
+      this.orbit.update();
+      this._lastPivotPos = info.pivot.clone();
+      return true;
+    }
+
     fitSite() {
       const sb = this.site.meta.siteBounds;
       const cx = (sb.minX + sb.maxX) * 0.5;
       const cy = (sb.minY + sb.maxY) * 0.5;
       const cz = (sb.minZ + sb.maxZ) * 0.5 - this.zDatum;
+      this._lastOrbitSelKey = '';
+      this._lastPivotPos = null;
       this.orbit.target.set(cx, cz, -cy);
       this.camera.position.set(cx + 68, cz + 56, -cy + 78);
       this.orbit.update();
@@ -362,6 +424,7 @@
           } : null;
         } else {
           this.transformOrig = null;
+          this.focusSelection();
         }
       });
 
@@ -392,9 +455,21 @@
       const dom = this.renderer.domElement;
       dom.addEventListener('pointerdown', (e) => {
         this.pointerDownPos = { x: e.clientX, y: e.clientY, button: e.button };
+        this._pendingOrbitFocus = (
+          e.button === 0 && !e.shiftKey && !e.ctrlKey && !e.metaKey &&
+          !this.isTransforming && !this.transform.axis &&
+          this.api.getState().selectedIds.length > 0
+        );
       });
 
       dom.addEventListener('pointermove', (e) => {
+        if (this._pendingOrbitFocus && this.pointerDownPos && !this.isTransforming) {
+          const moveDist = Math.hypot(e.clientX - this.pointerDownPos.x, e.clientY - this.pointerDownPos.y);
+          if (moveDist > 4) {
+            this._pendingOrbitFocus = false;
+            this.focusSelection();
+          }
+        }
         const state = this.api.getState();
         const pt = this._raycastSiteOrVolume(e);
         if (pt) {
@@ -407,6 +482,7 @@
       });
 
       dom.addEventListener('pointerup', (e) => {
+        this._pendingOrbitFocus = false;
         if (e.button !== 0 || this.isTransforming || !this.pointerDownPos) return;
         const moveDist = Math.hypot(e.clientX - this.pointerDownPos.x, e.clientY - this.pointerDownPos.y);
         this.pointerDownPos = null;
@@ -441,7 +517,8 @@
         if (hits.length > 0) {
           const volId = hits[0].object.userData.volId;
           if (e.shiftKey) this.api.toggleSelect(volId);
-          else this.api.selectVolume(volId, true);
+          else this.api.selectVolume(volId, e.detail < 2);
+          this.focusSelection({ fitDistance: e.detail >= 2 });
         } else if (!e.shiftKey) {
           this.api.clearSelection();
         }
@@ -640,6 +717,27 @@
           this.transform.detach();
         }
       }
+
+      // Revit-style orbit pivot lock around selected space(s)
+      const selKey = state.selectedIds.slice().sort().join(',');
+      const selInfo = this._getSelectionPivot3D(state);
+      const hintEl = document.getElementById('vp3dOrbitHint');
+      if (hintEl) {
+        if (!selInfo) {
+          hintEl.textContent = 'Click space to orbit around it & edit XYZ';
+        } else if (selInfo.count === 1 && selInfo.primaryVol) {
+          hintEl.textContent = `Orbit Pivot: ${selInfo.primaryVol.ref || selInfo.primaryVol.id} ${selInfo.primaryVol.short} · Drag to orbit`;
+        } else {
+          hintEl.textContent = `Orbit Pivot: ${selInfo.count} selected spaces · Drag to orbit`;
+        }
+      }
+      if (selInfo && !this.isTransforming && !opts.skip3DTransformSync) {
+        if (selKey !== this._lastOrbitSelKey || !this._lastPivotPos || this._lastPivotPos.distanceToSquared(selInfo.pivot) > 1e-4) {
+          this.focusSelection();
+        }
+      }
+      this._lastOrbitSelKey = selKey;
+      if (!selInfo) this._lastPivotPos = null;
 
       // 4. Rebuild Cut & Fill Soil Meshes
       this._rebuildEarthworkMeshes(state);

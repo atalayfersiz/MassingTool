@@ -55,7 +55,8 @@
         cutFill: true,
         translucentTerrain: false,
         rectDims: true,
-        annotations: true
+        annotations: true,
+        snap: true
       },
       iterations: [],
       nextGroupNum: 1,
@@ -459,6 +460,188 @@
     toast('Ungrouped selection');
   }
 
+  function findNearestOtherVolume(vol) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const other of state.volumes) {
+      if (other.id === vol.id) continue;
+      const d = eng.minEdgeDistanceRects(vol, other, state.useGross);
+      if (d < bestDist) {
+        bestDist = d;
+        best = other;
+      }
+    }
+    return best;
+  }
+
+  function snapVolumeToNearest(volId, opts = {}) {
+    const vol = getVolume(volId);
+    if (!vol) return false;
+    const B = findNearestOtherVolume(vol);
+    if (!B) {
+      toast('No nearby bubble to snap to');
+      return false;
+    }
+    const rotB = B.rot || 0;
+    const matchAngle = opts.matchAngle !== false;
+    const newRot = matchAngle
+      ? rotB + Math.round(((vol.rot || 0) - rotB) / (Math.PI * 0.5)) * (Math.PI * 0.5)
+      : (vol.rot || 0);
+
+    const cB = Math.cos(rotB), sB = Math.sin(rotB);
+    const dx = vol.x - B.x, dy = vol.y - B.y;
+    const rx = dx * cB + dy * sB;
+    const ry = -dx * sB + dy * cB;
+
+    const dimsA = eng.getEffectiveDims({ ...vol, rot: newRot }, state.useGross);
+    const dimsB = eng.getEffectiveDims(B, state.useGross);
+    const dRot = newRot - rotB;
+    const ca = Math.abs(Math.cos(dRot)), sa = Math.abs(Math.sin(dRot));
+    const halfAx = (dimsA.w * ca + dimsA.d * sa) * 0.5;
+    const halfAy = (dimsA.w * sa + dimsA.d * ca) * 0.5;
+    const halfBx = dimsB.w * 0.5;
+    const halfBy = dimsB.d * 0.5;
+    const abutX = halfBx + halfAx;
+    const abutY = halfBy + halfAy;
+
+    let targetRx = rx;
+    let targetRy = ry;
+    if (Math.abs(rx) / Math.max(1, abutX) >= Math.abs(ry) / Math.max(1, abutY)) {
+      targetRx = (rx >= 0 ? 1 : -1) * abutX;
+      let bestY = ry, bestDY = 3.0;
+      for (const cy of [0, halfBy - halfAy, -(halfBy - halfAy)]) {
+        const dist = Math.abs(ry - cy);
+        if (dist < bestDY) { bestDY = dist; bestY = cy; }
+      }
+      targetRy = bestY;
+    } else {
+      targetRy = (ry >= 0 ? 1 : -1) * abutY;
+      let bestX = rx, bestDX = 3.0;
+      for (const cx of [0, halfBx - halfAx, -(halfBx - halfAx)]) {
+        const dist = Math.abs(rx - cx);
+        if (dist < bestDX) { bestDX = dist; bestX = cx; }
+      }
+      targetRx = bestX;
+    }
+
+    const nx = B.x + targetRx * cB - targetRy * sB;
+    const ny = B.y + targetRx * sB + targetRy * cB;
+    const zOffset = vol.zBase - eng.getGroundZ(vol.x, vol.y);
+    const zBase = Math.round((eng.getGroundZ(nx, ny) + zOffset) * 100) / 100;
+    updateVolume(vol.id, { x: nx, y: ny, rot: newRot, zBase }, { forceSidebar: true });
+    toast(`Snapped ${vol.ref || vol.id} to ${B.ref || B.id}`);
+    return true;
+  }
+
+  function matchNearestAngle(volId) {
+    const vol = getVolume(volId);
+    if (!vol) return false;
+    const B = findNearestOtherVolume(vol);
+    if (!B) {
+      toast('No nearby bubble to match angle');
+      return false;
+    }
+    updateVolume(vol.id, { rot: B.rot || 0 }, { forceSidebar: true });
+    toast(`Matched angle to ${B.ref || B.id}`);
+    return true;
+  }
+
+  function alignSelectedVolumes(mode) {
+    const selVols = state.selectedIds.map(getVolume).filter(Boolean);
+    if (selVols.length < 2) {
+      toast('Select 2 or more bubbles to align');
+      return false;
+    }
+    const anchor = selVols[0];
+    const theta = anchor.rot || 0;
+    const c = Math.cos(theta), s = Math.sin(theta);
+
+    const items = selVols.map((v) => {
+      const dx = v.x - anchor.x;
+      const dy = v.y - anchor.y;
+      const u = dx * c + dy * s;
+      const vCoord = -dx * s + dy * c;
+      const dims = eng.getEffectiveDims(v, state.useGross);
+      const dRot = (v.rot || 0) - theta;
+      const ca = Math.abs(Math.cos(dRot)), sa = Math.abs(Math.sin(dRot));
+      const hu = (dims.w * ca + dims.d * sa) * 0.5;
+      const hv = (dims.w * sa + dims.d * ca) * 0.5;
+      return {
+        vol: v,
+        dims,
+        u,
+        v: vCoord,
+        hu,
+        hv,
+        targetU: u,
+        targetV: vCoord,
+        targetRot: v.rot || 0,
+        targetZBase: v.zBase
+      };
+    });
+
+    const a0 = items[0];
+    if (mode === 'left') {
+      items.forEach(it => { it.targetU = -a0.hu + it.hu; });
+    } else if (mode === 'center-u') {
+      items.forEach(it => { it.targetU = 0; });
+    } else if (mode === 'right') {
+      items.forEach(it => { it.targetU = a0.hu - it.hu; });
+    } else if (mode === 'top') {
+      items.forEach(it => { it.targetV = a0.hv - it.hv; });
+    } else if (mode === 'center-v') {
+      items.forEach(it => { it.targetV = 0; });
+    } else if (mode === 'bottom') {
+      items.forEach(it => { it.targetV = -a0.hv + it.hv; });
+    } else if (mode === 'abut-row') {
+      const sorted = items.slice().sort((a, b) => a.u - b.u);
+      let curU = sorted[0].u - sorted[0].dims.w * 0.5;
+      for (const it of sorted) {
+        it.targetRot = theta;
+        it.targetV = 0;
+        it.targetU = curU + it.dims.w * 0.5;
+        curU += it.dims.w;
+      }
+    } else if (mode === 'abut-col') {
+      const sorted = items.slice().sort((a, b) => b.v - a.v);
+      let curV = sorted[0].v + sorted[0].dims.d * 0.5;
+      for (const it of sorted) {
+        it.targetRot = theta;
+        it.targetU = 0;
+        it.targetV = curV - it.dims.d * 0.5;
+        curV -= it.dims.d;
+      }
+    } else if (mode === 'dist-u') {
+      const sorted = items.slice().sort((a, b) => a.u - b.u);
+      const u0 = sorted[0].u;
+      const span = sorted[sorted.length - 1].u - u0;
+      sorted.forEach((it, idx) => { it.targetU = u0 + (span * idx) / (sorted.length - 1); });
+    } else if (mode === 'dist-v') {
+      const sorted = items.slice().sort((a, b) => a.v - b.v);
+      const v0 = sorted[0].v;
+      const span = sorted[sorted.length - 1].v - v0;
+      sorted.forEach((it, idx) => { it.targetV = v0 + (span * idx) / (sorted.length - 1); });
+    } else if (mode === 'match-angle') {
+      items.forEach(it => { it.targetRot = theta; });
+    } else if (mode === 'match-z') {
+      items.forEach(it => { it.targetZBase = Math.round(anchor.zBase * 100) / 100; });
+    }
+
+    const updates = items.map((it) => {
+      if (mode === 'match-angle') return { id: it.vol.id, rot: it.targetRot };
+      if (mode === 'match-z') return { id: it.vol.id, zBase: it.targetZBase };
+      const nx = anchor.x + it.targetU * c - it.targetV * s;
+      const ny = anchor.y + it.targetU * s + it.targetV * c;
+      const zOffset = it.vol.zBase - eng.getGroundZ(it.vol.x, it.vol.y);
+      const zBase = Math.round((eng.getGroundZ(nx, ny) + zOffset) * 100) / 100;
+      return { id: it.vol.id, x: nx, y: ny, rot: it.targetRot, zBase };
+    });
+
+    updateVolumesBatch(updates, { forceSidebar: true });
+    toast(`Aligned ${selVols.length} bubbles (${mode})`);
+    return true;
+  }
+
   function updateActivePlane(patch) {
     const p = getActivePlane();
     if (!p) return;
@@ -792,6 +975,11 @@
     document.getElementById('btn3dClipToggle').classList.toggle('active', !!(activePlane && activePlane.enabled));
     document.getElementById('btn3dTranslucent').classList.toggle('active', !!state.layers.translucentTerrain);
 
+    const snapEnabled = state.layers.snap !== false;
+    const snapBtn = document.getElementById('btnToggleSnap');
+    if (snapBtn) snapBtn.classList.toggle('active', snapEnabled);
+    const secSnapBtn = document.getElementById('btnSecSnapToggle');
+    if (secSnapBtn) secSnapBtn.classList.toggle('active', snapEnabled);
     const rectDimBtn = document.getElementById('btnToggleRectDims');
     if (rectDimBtn) rectDimBtn.classList.toggle('active', !!state.layers.rectDims);
     const planAnnBtn = document.getElementById('btnPlanAnnToggle');
@@ -1226,6 +1414,25 @@
             <button class="btn" id="sbUngrpBtn" style="flex:1">Ungroup</button>
           </div>
           <div class="field">
+            <label>Align &amp; Snap Bubbles (to First Selected)</label>
+            <div class="align-grid">
+              <button type="button" class="btn align-btn" data-align="left" title="Align Left edges">Left</button>
+              <button type="button" class="btn align-btn" data-align="center-u" title="Align Horizontal centers">Center H</button>
+              <button type="button" class="btn align-btn" data-align="right" title="Align Right edges">Right</button>
+              <button type="button" class="btn align-btn" data-align="top" title="Align Top edges">Top</button>
+              <button type="button" class="btn align-btn" data-align="center-v" title="Align Vertical centers">Center V</button>
+              <button type="button" class="btn align-btn" data-align="bottom" title="Align Bottom edges">Bottom</button>
+            </div>
+            <div class="align-grid-2" style="margin-top:4px;">
+              <button type="button" class="btn align-btn" data-align="abut-row" title="Pack edge-to-edge along X row">Abut Row (H)</button>
+              <button type="button" class="btn align-btn" data-align="abut-col" title="Pack edge-to-edge along Y column">Abut Col (V)</button>
+              <button type="button" class="btn align-btn" data-align="dist-u" title="Distribute evenly horizontally">Distribute H</button>
+              <button type="button" class="btn align-btn" data-align="dist-v" title="Distribute evenly vertically">Distribute V</button>
+              <button type="button" class="btn align-btn" data-align="match-angle" title="Match angle of anchor bubble">Match Angle</button>
+              <button type="button" class="btn align-btn" data-align="match-z" title="Match base elevation of anchor bubble">Match Base Z</button>
+            </div>
+          </div>
+          <div class="field">
             <label>Set Floor Height for All (m)</label>
             <div class="row-between">
               <input type="number" id="sbBatchHeight" step="0.1" min="1.5" max="12" value="${avgH.toFixed(1)}" style="flex:1" />
@@ -1253,6 +1460,9 @@
       `;
       document.getElementById('sbGrpBtn').addEventListener('click', groupSelected);
       document.getElementById('sbUngrpBtn').addEventListener('click', ungroupSelected);
+      body.querySelectorAll('[data-align]').forEach(btn => {
+        btn.addEventListener('click', () => alignSelectedVolumes(btn.dataset.align));
+      });
       document.getElementById('sbApplyBatchHeight').addEventListener('click', () => {
         const val = Math.max(1.5, parseFloat(document.getElementById('sbBatchHeight').value) || 3.0);
         updateVolumesBatch(selVols.map(v => ({ id: v.id, floorHeight: val })));
@@ -1343,6 +1553,10 @@
           <label>Total Height</label>
           <input type="text" disabled value="${dims.totalHeight.toFixed(1)} m (${dims.footprintArea.toFixed(1)}m²/F)" />
         </div>
+      </div>
+      <div class="row-between">
+        <button class="btn" id="btnSnapNearest" style="flex:1">Snap to Nearest</button>
+        <button class="btn" id="btnMatchAngle" style="flex:1">Match Angle</button>
       </div>
       <div class="row-between">
         <button class="btn" id="btnSnapZ" style="flex:1">Snap Z to Slope</button>
@@ -1603,6 +1817,8 @@
       const zb = parseFloat(e.target.value);
       if (!Number.isNaN(zb)) updateVolume(vol.id, { zBase: zb }, { forceSidebar: true });
     });
+    document.getElementById('btnSnapNearest').addEventListener('click', () => snapVolumeToNearest(vol.id));
+    document.getElementById('btnMatchAngle').addEventListener('click', () => matchNearestAngle(vol.id));
     document.getElementById('btnSnapZ').addEventListener('click', () => {
       updateVolume(vol.id, { zBase: Math.round(eng.getGroundZ(vol.x, vol.y) * 100) / 100 }, { forceSidebar: true });
     });
@@ -1775,6 +1991,7 @@
       ['plotBuildings', 'Existing Buildings Inside Plot'],
       ['trees', 'Site Vegetation (Trees)'],
       ['cutFill', 'Cut & Fill Soil Volumes'],
+      ['snap', 'Magnetic Snap & Smart Guides (S)'],
       ['rectDims', 'Rectangle Dimensions (Zoomed)'],
       ['annotations', 'Annotations (Text & Lines)'],
       ['translucentTerrain', 'Translucent Terrain (3D)']
@@ -2074,6 +2291,14 @@
     setTimeout(handleResize, 20);
   });
 
+  function toggleSnapLayer() {
+    state.layers.snap = state.layers.snap === false;
+    refreshAll();
+    toast(state.layers.snap ? 'Magnetic Snap & Align ON' : 'Magnetic Snap & Align OFF');
+  }
+  document.getElementById('btnToggleSnap').addEventListener('click', toggleSnapLayer);
+  document.getElementById('btnSecSnapToggle').addEventListener('click', toggleSnapLayer);
+
   document.getElementById('btnToggleRectDims').addEventListener('click', () => {
     state.layers.rectDims = !state.layers.rectDims;
     refreshAll();
@@ -2304,6 +2529,7 @@
     else if (k === 'd') { setTool('dimension'); }
     else if (k === 'l') { setTool('line'); }
     else if (k === 'a') { setTool('text'); }
+    else if (k === 's') { toggleSnapLayer(); }
     else if (k === 'r') {
       state.layers.rectDims = !state.layers.rectDims;
       refreshAll();
@@ -2402,6 +2628,9 @@
     getState: () => state,
     placeStarterProgram,
     clearBoard,
+    alignSelectedVolumes,
+    snapVolumeToNearest,
+    matchNearestAngle,
     planView,
     view3D,
     sectionView,

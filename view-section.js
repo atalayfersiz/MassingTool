@@ -21,6 +21,7 @@
       this.hoverItem = null;
       this.spaceHeld = false;
       this.lastSlices = [];
+      this.snapGuides = [];
 
       this._bindEvents();
     }
@@ -295,6 +296,12 @@
               type: 'move',
               id: vol.id,
               startSec: sec,
+              origSlice: {
+                sMin: hit.slice.sMin,
+                sMax: hit.slice.sMax,
+                zBase: hit.slice.zBase,
+                zTop: hit.slice.zTop
+              },
               origins
             };
           }
@@ -424,10 +431,18 @@
         }
 
         if (this.dragState.type === 'move') {
-          const ds = sec.s - this.dragState.startSec.s;
-          const dz = sec.z - this.dragState.startSec.z;
+          let ds = sec.s - this.dragState.startSec.s;
+          let dz = sec.z - this.dragState.startSec.z;
           const activePlane = this.api.getActivePlane();
           const basis = window.GROUNDWORK_ENGINE.getPlaneBasis(activePlane);
+          if (state.layers.snap !== false && !e.altKey) {
+            const snap = this._computeSecMoveSnap(ds, dz, basis, state);
+            ds = snap.ds;
+            dz = snap.dz;
+            this.snapGuides = snap.guides || [];
+          } else {
+            this.snapGuides = [];
+          }
           const dx = ds * basis.tx;
           const dy = ds * basis.ty;
           const updates = [];
@@ -445,6 +460,7 @@
 
       this.canvas.addEventListener('pointerup', (e) => {
         if (!this.dragState) return;
+        this.snapGuides = [];
         if (this.dragState.type === 'line-draw' && this.lineDraft && this.lineDraft.moved) {
           const p2 = this.lineDraft.p2;
           if (Math.hypot(p2.s - this.lineDraft.p1.s, p2.z - this.lineDraft.p1.z) > 0.2) {
@@ -965,6 +981,11 @@
         ctx.restore();
       }
 
+      // Magnetic Snap Guides in Section
+      if (this.snapGuides && this.snapGuides.length > 0) {
+        this._drawSnapGuides(ctx, pal, state.theme === 'dark');
+      }
+
       // 6. Section dimensions + draft
       for (const dim of state.dimensions.filter(d => d.view === 'section' && d.planeId === plane.id)) {
         const isSelDim = !!(state.selectedItem && state.selectedItem.kind === 'dim' && state.selectedItem.id === dim.id);
@@ -1435,6 +1456,127 @@
       const g = clamp(parseInt(m[2], 16) * factor).toString(16).padStart(2, '0');
       const b = clamp(parseInt(m[3], 16) * factor).toString(16).padStart(2, '0');
       return `#${r}${g}${b}`;
+    }
+
+    _computeSecMoveSnap(ds, dz, basis, state) {
+      const eng = window.GROUNDWORK_ENGINE;
+      const os = this.dragState.origSlice;
+      const primaryOrig = this.dragState.origins[this.dragState.id];
+      if (!os || !primaryOrig) return { ds, dz, guides: [] };
+
+      const dragIds = new Set(Object.keys(this.dragState.origins));
+      const rawSMin = os.sMin + ds;
+      const rawSMax = os.sMax + ds;
+      const rawZBase = os.zBase + dz;
+      const rawZTop = os.zTop + dz;
+      const zTol = 0.45;
+      const sTol = 0.6;
+
+      let bestS = null;
+      let bestZ = null;
+
+      // Snap Z to slope at raw X/Y
+      const nx = primaryOrig.x + ds * basis.tx;
+      const ny = primaryOrig.y + ds * basis.ty;
+      const gz = eng.getGroundZ(nx, ny);
+      const gzErr = Math.abs(rawZBase - gz);
+      if (gzErr < zTol) {
+        bestZ = {
+          err: gzErr,
+          newDz: gz - os.zBase,
+          lineZ: gz,
+          sMin: rawSMin - 4,
+          sMax: rawSMax + 4,
+          label: `Slope Z ${gz.toFixed(1)}m`
+        };
+      }
+
+      for (const other of this.lastSlices) {
+        if (!other || !other.vol || dragIds.has(other.vol.id)) continue;
+
+        const zCands = [
+          { cur: rawZBase, target: other.zBase, newDz: other.zBase - os.zBase, label: `Base Z (${other.vol.ref})` },
+          { cur: rawZBase, target: other.zTop, newDz: other.zTop - os.zBase, label: `Stack Z (${other.vol.ref})` },
+          { cur: rawZTop, target: other.zBase, newDz: other.zBase - os.zTop, label: `Flush Z (${other.vol.ref})` }
+        ];
+        for (const zc of zCands) {
+          const err = Math.abs(zc.cur - zc.target);
+          if (err < zTol && (!bestZ || err < bestZ.err)) {
+            bestZ = {
+              err,
+              newDz: zc.newDz,
+              lineZ: zc.target,
+              sMin: Math.min(rawSMin, other.sMin) - 3,
+              sMax: Math.max(rawSMax, other.sMax) + 3,
+              label: zc.label
+            };
+          }
+        }
+
+        const sCands = [
+          { cur: rawSMin, target: other.sMax, newDs: other.sMax - os.sMin, label: 'Abut' },
+          { cur: rawSMax, target: other.sMin, newDs: other.sMin - os.sMax, label: 'Abut' },
+          { cur: rawSMin, target: other.sMin, newDs: other.sMin - os.sMin, label: 'Flush' },
+          { cur: rawSMax, target: other.sMax, newDs: other.sMax - os.sMax, label: 'Flush' }
+        ];
+        for (const sc of sCands) {
+          const err = Math.abs(sc.cur - sc.target);
+          if (err < sTol && (!bestS || err < bestS.err)) {
+            bestS = {
+              err,
+              newDs: sc.newDs,
+              lineS: sc.target,
+              zMin: Math.min(rawZBase, other.zBase) - 2,
+              zMax: Math.max(rawZTop, other.zTop) + 2.5,
+              label: sc.label
+            };
+          }
+        }
+      }
+
+      const guides = [];
+      const outDs = bestS ? bestS.newDs : ds;
+      const outDz = bestZ ? bestZ.newDz : dz;
+      if (bestZ) {
+        guides.push({ s1: bestZ.sMin, z1: bestZ.lineZ, s2: bestZ.sMax, z2: bestZ.lineZ, label: bestZ.label });
+      }
+      if (bestS) {
+        guides.push({ s1: bestS.lineS, z1: bestS.zMin, s2: bestS.lineS, z2: bestS.zMax, label: bestS.label });
+      }
+      return { ds: outDs, dz: outDz, guides };
+    }
+
+    _drawSnapGuides(ctx, pal, isDark) {
+      const col = isDark ? '#e07b5f' : '#b85d43';
+      ctx.save();
+      for (const g of this.snapGuides) {
+        const a = this.secToScreen(g.s1, g.z1);
+        const b = this.secToScreen(g.s2, g.z2);
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        if (g.label) {
+          const mx = (a.x + b.x) * 0.5;
+          const my = (a.y + b.y) * 0.5;
+          ctx.font = '600 9.5px ui-monospace, monospace';
+          const tw = ctx.measureText(g.label).width + 10;
+          ctx.fillStyle = pal.badgeBg;
+          ctx.strokeStyle = col;
+          ctx.lineWidth = 1;
+          ctx.fillRect(mx - tw * 0.5, my - 8, tw, 15);
+          ctx.strokeRect(mx - tw * 0.5, my - 8, tw, 15);
+          ctx.fillStyle = col;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(g.label, mx, my);
+        }
+      }
+      ctx.restore();
     }
 
     _esc(str) {
